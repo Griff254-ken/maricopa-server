@@ -141,6 +141,15 @@ const PREFIX = (env.COLLECTION_PREFIX || '').trim();
 const Product = mongoose.model('Product', ProductSchema, PREFIX + 'products');
 const Order = mongoose.model('Order', OrderSchema, PREFIX + 'orders');
 
+/* ---- Admin: delete an unreleased order ---- */
+app.delete('/api/admin/orders/:id', ah(async (req, res) => {
+  const cur = await Order.findOne({ id: req.params.id }).lean();
+  if (!cur) throw new HttpError(404, 'Order not found.');
+  if (cur.adminConfirmed) throw new HttpError(409, 'Released orders cannot be deleted. They are kept as a record.');
+  await Order.deleteOne({ id: req.params.id });
+  res.json({ ok: true });
+}));
+
 /* ---------------- Mappers ---------------- */
 const productOut = p => ({
   id: String(p._id),
