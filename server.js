@@ -135,8 +135,9 @@ const OrderSchema = new mongoose.Schema({
 OrderSchema.index({ idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } });
 OrderSchema.index({ createdAt: -1 });
 
-const Product = mongoose.model('Product', ProductSchema);
-const Order = mongoose.model('Order', OrderSchema);
+const PREFIX = (env.COLLECTION_PREFIX || '').trim();
+const Product = mongoose.model('Product', ProductSchema, PREFIX + 'products');
+const Order = mongoose.model('Order', OrderSchema, PREFIX + 'orders');
 
 /* ---------------- Mappers ---------------- */
 const productOut = p => ({
@@ -357,9 +358,17 @@ app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
-const allowed = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+/* ALLOWED_ORIGINS is forgiving: spaces, quotes, trailing slashes and even full page
+   addresses (https://site.com/admin.html) are reduced to the origin (https://site.com). */
+const toOrigin = v => {
+  v = String(v || '').trim().replace(/^["']|["']$/g, '').trim();
+  if (!v) return '';
+  if (v === '*' || v === 'null') return v;
+  try { return new URL(/^https?:\/\//i.test(v) ? v : 'https://' + v).origin; } catch { return ''; }
+};
+const allowed = [...new Set((env.ALLOWED_ORIGINS || '').split(',').map(toOrigin).filter(Boolean))];
 const allowAll = !allowed.length || allowed.includes('*');
-const originAllowed = origin => !origin || allowAll || allowed.includes(String(origin).replace(/\/+$/, ''));
+const originAllowed = origin => !origin || allowAll || allowed.includes(toOrigin(origin));
 
 /* /health is open to every origin so the admin page can diagnose connection problems.
    It reveals nothing sensitive (only whether this caller's origin is allowed). */
@@ -694,6 +703,7 @@ async function main() {
   if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
   else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
   if (!darajaReady()) console.warn('⚠️  Daraja is not fully configured (need DARAJA_CONSUMER_KEY/SECRET/SHORTCODE/PASSKEY, PUBLIC_URL, CALLBACK_SECRET). Payments disabled.');
+  console.log('🌐 Allowed origins:', allowAll ? 'ANY' : allowed.join(', '));
   if (!allowed.length) console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it in production.');
 
   await mongoose.connect(env.MONGODB_URI, { serverSelectionTimeoutMS: 20000 });
