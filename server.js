@@ -20,14 +20,14 @@
 
 require('dotenv').config();
 
-const crypto = require('node:crypto');
-const path = require('node:path');
-const fs = require('node:fs');
-const express = require('express');
-const cors = require('cors');
-const helmet = require('helmet');
+const crypto      = require('node:crypto');
+const path        = require('node:path');
+const fs          = require('node:fs');
+const express     = require('express');
+const cors        = require('cors');
+const helmet      = require('helmet');
 const compression = require('compression');
-const rateLimit = require('express-rate-limit');
+const rateLimit   = require('express-rate-limit');
 const { MongoClient, ServerApiVersion, Binary } = require('mongodb');
 
 /* =====================================================================
@@ -49,7 +49,7 @@ const CFG = {
   port: Number(env.PORT) || 3000,
   mongoUri: env.MONGODB_URI,
   dbName: env.MONGODB_DB || 'maricopa',
-  publicUrl: (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''), // Render sets RENDER_EXTERNAL_URL automatically
+  publicUrl: (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''),
   collectionPrefix: env.COLLECTION_PREFIX ?? 'store_',
   allowedOrigins: list(env.ALLOWED_ORIGINS).map(o => o.replace(/\/+$/, '')),
   trustProxy: parseTrustProxy(env.TRUST_PROXY),
@@ -60,17 +60,18 @@ const CFG = {
     key: env.MPESA_CONSUMER_KEY || '',
     secret: env.MPESA_CONSUMER_SECRET || '',
     shortcode: env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
-    passkey: env.MPESA_PASSKEY || (env.MPESA_ENV === 'production' ? '' : 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'), // public Daraja sandbox passkey
+    passkey: env.MPESA_PASSKEY || (env.MPESA_ENV === 'production' ? '' : 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'),
     partyB: env.MPESA_PARTY_B || env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
     txType: env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
     callbackSecret: env.MPESA_CALLBACK_SECRET || '',
-    testPhone: normPhone(env.MPESA_TEST_PHONE || ''), // optional: force every STK prompt to this number while testing
+    testPhone: normPhone(env.MPESA_TEST_PHONE || ''),
     callbackIps: list(env.MPESA_CALLBACK_IPS),
     reconcile: flag(env.MPESA_RECONCILE, true),
     maxAttempts: 8,
     minRetryMs: 25_000
   }
 };
+
 // No MPESA_CALLBACK_SECRET set? Derive a stable private one from your consumer secret.
 if (!CFG.mpesa.callbackSecret && CFG.mpesa.secret) {
   CFG.mpesa.callbackSecret = crypto.createHmac('sha256', CFG.mpesa.secret).update('maricopa-callback').digest('hex').slice(0, 40);
@@ -119,6 +120,7 @@ class HttpError extends Error {
     this.expose = true;
   }
 }
+
 const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const sha256 = s => crypto.createHash('sha256').update(s).digest();
 const safeEqual = (a, b) => crypto.timingSafeEqual(sha256(String(a)), sha256(String(b)));
@@ -176,14 +178,13 @@ async function connectDb() {
   });
   await client.connect();
   db = client.db(CFG.dbName);
-  // Prefixed so we never collide with other apps (e.g. the inventory app) in the same database.
+
   const pf = CFG.collectionPrefix;
-  col.products = db.collection(pf + 'products');
-  col.images = db.collection(pf + 'product_images');
-  col.orders = db.collection(pf + 'orders');
+  col.products  = db.collection(pf + 'products');
+  col.images    = db.collection(pf + 'product_images');
+  col.orders    = db.collection(pf + 'orders');
   col.callbacks = db.collection(pf + 'payment_callbacks');
 
-  // Explicitly named indexes; a conflicting pre-existing index is logged, never fatal.
   const ensure = async (collection, key, options) => {
     try {
       await collection.createIndex(key, options);
@@ -191,6 +192,7 @@ async function connectDb() {
       console.warn(`⚠️  Index "${options.name}" on ${collection.collectionName} skipped: ${e.message}`);
     }
   };
+
   await Promise.all([
     ensure(col.products, { category: 1, name: 1 }, { name: 'mca_category_name' }),
     ensure(col.orders, { reference: 1 }, { name: 'mca_reference_unique', unique: true }),
@@ -204,7 +206,9 @@ async function connectDb() {
 
   if (CFG.seedDemo && (await col.products.estimatedDocumentCount()) === 0) {
     const now = new Date();
-    await col.products.insertMany(SEED.map(p => ({ _id: crypto.randomUUID(), image: null, inStock: true, createdAt: now, updatedAt: now, ...p })));
+    await col.products.insertMany(SEED.map(p => ({
+      _id: crypto.randomUUID(), image: null, inStock: true, createdAt: now, updatedAt: now, ...p
+    })));
     console.log(`Seeded ${SEED.length} demo products (replace prices from the admin panel).`);
   }
 }
@@ -300,7 +304,14 @@ function detectImageType(buf) {
   return null;
 }
 
-/** Interprets the `image` field sent by admin.html. */
+/**
+ * Interprets the `image` field sent by admin.html.
+ *   undefined      → keep the current image (only on PUT)
+ *   "" or null     → clear the image
+ *   data:...       → upload (base64)
+ *   our own URL    → keep the current image
+ *   any other URL  → store as-is
+ */
 function parseImageInput(input, productId) {
   if (input === undefined) return { action: 'keep' };
   if (input === null || input === '') return { action: 'clear' };
@@ -324,7 +335,7 @@ function parseImageInput(input, productId) {
   if (!/^https?:$/.test(u.protocol) || input.length > 2000) throw new HttpError(400, 'Invalid image URL.');
   const own = /\/api\/products\/([^/]+)\/image\/?$/.exec(u.pathname);
   if (own) {
-    if (decodeURIComponent(own[1]) === productId) return { action: 'keep' }; // admin re-sent our own URL
+    if (decodeURIComponent(own[1]) === productId) return { action: 'keep' };
     throw new HttpError(400, 'Invalid image URL.');
   }
   return { action: 'url', url: input };
@@ -548,7 +559,6 @@ async function markPaid(order, { receipt, amount, phone, via }) {
     const cur = await col.orders.findOne({ _id: order._id });
     if (!cur) return;
     if (cur.paymentStatus === 'paid' && receipt && !cur.mpesaReceipt) {
-      // Paid earlier via status query (no receipt) → attach the receipt now.
       await col.orders.updateOne({ _id: cur._id }, { $set: { mpesaReceipt: receipt, paidAmount: amount, paidPhone: phone, updatedAt: now } });
     } else if (cur.paymentStatus === 'cancelled') {
       await col.orders.updateOne({ _id: cur._id }, { $set: { lateReceipt: receipt || null, lateReceiptAmount: amount ?? null, updatedAt: now } });
@@ -619,7 +629,7 @@ async function reconcileOrder(o) {
     CheckoutRequestID: claimed.checkoutRequestId
   });
   const d = r.data || {};
-  if (d.ResultCode === undefined) return claimed; // still processing, or transient Daraja error
+  if (d.ResultCode === undefined) return claimed;
 
   const code = Number(d.ResultCode);
   if (code === 0) await markPaid(claimed, { via: 'query' });
@@ -635,8 +645,8 @@ app.set('trust proxy', CFG.trustProxy);
 app.disable('x-powered-by');
 
 app.use(helmet({
-  contentSecurityPolicy: false,                         // the frontends use inline scripts/styles
-  crossOriginResourcePolicy: { policy: 'cross-origin' } // product images are loaded from another origin
+  contentSecurityPolicy: false,
+  crossOriginResourcePolicy: { policy: 'cross-origin' }
 }));
 app.use(compression());
 
@@ -672,7 +682,7 @@ const ordersLimiter = limiter(10 * 60_000, 30, 'Too many orders from this connec
 const stkLimiter = limiter(10 * 60_000, 20, 'Too many payment attempts. Please wait a few minutes.');
 const statusLimiter = limiter(60_000, 200, 'Too many status checks. Please slow down.');
 const adminAuthLimiter = limiter(15 * 60_000, 20, 'Too many failed sign-in attempts. Try again in 15 minutes.', {
-  requestWasSuccessful: (req, res) => res.statusCode !== 401 // only failed logins count
+  requestWasSuccessful: (req, res) => res.statusCode !== 401
 });
 
 /* ---------------- Health ---------------- */
@@ -695,7 +705,7 @@ app.get('/api/products/:id/image', wrap(async (req, res) => {
   const etag = `"${doc.hash}"`;
   res.set({
     'Content-Type': doc.contentType,
-    'Cache-Control': 'public, max-age=31536000, immutable', // URL carries ?v=<hash>
+    'Cache-Control': 'public, max-age=31536000, immutable',
     ETag: etag,
     'X-Content-Type-Options': 'nosniff'
   });
@@ -749,9 +759,8 @@ app.post('/api/orders', ordersLimiter, wrap(async (req, res) => {
       if (e.code !== 11000) throw e;
       if (e.keyPattern?.idempotencyKey) {
         const again = await col.orders.findOne({ idempotencyKey: key });
-        if (again) return reply(again); // concurrent duplicate request
+        if (again) return reply(again);
       }
-      // reference collision → loop and generate a new one
     }
   }
   throw new HttpError(500, 'Could not create the order. Please try again.');
@@ -761,7 +770,7 @@ app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
   const orderId = str(req.body?.orderId, { required: true, max: 64, field: 'orderId' });
   const enteredPhone = normPhone(req.body?.phone);
   if (!enteredPhone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
-  const phone = CFG.mpesa.testPhone || enteredPhone; // test override (see MPESA_TEST_PHONE)
+  const phone = CFG.mpesa.testPhone || enteredPhone;
   if (!mpesaConfigured()) throw new HttpError(503, 'Payments are not available right now. Please contact us.');
 
   const order = await col.orders.findOne({ _id: orderId });
@@ -770,7 +779,6 @@ app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
   if (order.paymentStatus === 'cancelled') throw new HttpError(409, 'This order was cancelled.');
   if (order.stkAttempts >= CFG.mpesa.maxAttempts) throw new HttpError(429, 'Too many payment attempts for this order. Please contact us.');
 
-  // Atomically claim the right to send a prompt (prevents double prompts).
   const now = new Date();
   const claimed = await col.orders.findOneAndUpdate(
     {
@@ -784,14 +792,14 @@ app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
   if (!claimed) {
     const cur = await col.orders.findOne({ _id: orderId });
     if (cur?.paymentStatus === 'paid') return res.json({ alreadyPaid: true, checkoutRequestId: cur.checkoutRequestId });
-    return res.json({ checkoutRequestId: cur?.checkoutRequestId || null, reused: true }); // a prompt was just sent
+    return res.json({ checkoutRequestId: cur?.checkoutRequestId || null, reused: true });
   }
 
   let sent;
   try {
     sent = await sendStkPush(claimed, phone);
   } catch (e) {
-    await col.orders.updateOne({ _id: orderId }, { $set: { lastStkAt: null } }); // allow immediate retry
+    await col.orders.updateOne({ _id: orderId }, { $set: { lastStkAt: null } });
     throw e;
   }
 
@@ -799,12 +807,10 @@ app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
     $set: { checkoutRequestId: sent.checkoutRequestId, merchantRequestId: sent.merchantRequestId, payerPhone: phone, updatedAt: new Date() },
     $addToSet: { checkoutRequestIds: sent.checkoutRequestId }
   });
-  // Masked number the prompt actually went to (differs from the typed one when MPESA_TEST_PHONE is set).
   const sentTo = `+${phone.slice(0, 5)}•••${phone.slice(-3)}`;
   res.json({ checkoutRequestId: sent.checkoutRequestId, sentTo });
 }));
 
-/* Safaricom → us. Path secret + optional IP allow-list (Daraja callbacks are unsigned). */
 app.post('/api/payments/callback/:secret', wrap(async (req, res) => {
   if (!CFG.mpesa.callbackSecret || !safeEqual(req.params.secret, CFG.mpesa.callbackSecret)) {
     return res.status(403).json({ ResultCode: 1, ResultDesc: 'Forbidden' });
@@ -847,22 +853,20 @@ function requireAdmin(req, res, next) {
     const i = decoded.indexOf(':');
     if (i >= 0) { user = decoded.slice(0, i); pass = decoded.slice(i + 1); }
   }
-  // Evaluate both (no short-circuit) so timing doesn't reveal which was wrong.
   const okUser = safeEqual(user, CFG.admin.user);
   const okPass = safeEqual(pass, CFG.admin.pass);
   if (okUser && okPass) { req.admin = { user }; return next(); }
-  // No WWW-Authenticate header on purpose: it would trigger the browser's native login popup.
   res.status(401).json({ error: 'Invalid username or password.' });
 }
 
 const admin = express.Router();
-admin.use(adminAuthLimiter, requireAdmin, express.json({ limit: '4mb' })); // 4 MB: base64 product images
+admin.use(adminAuthLimiter, requireAdmin, express.json({ limit: '4mb' }));
 admin.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 
 /* ---- Orders ---- */
 const ORDER_FILTERS = {
   all: () => ({}),
-  paid: () => ({ paymentStatus: 'paid', adminConfirmed: false }), // awaiting confirmation
+  paid: () => ({ paymentStatus: 'paid', adminConfirmed: false }),
   confirmed: () => ({ adminConfirmed: true }),
   pending: () => ({ paymentStatus: 'pending' }),
   failed: () => ({ paymentStatus: 'failed' }),
@@ -887,7 +891,7 @@ admin.post('/orders/:id/confirm', wrap(async (req, res) => {
 
   const cur = await col.orders.findOne({ _id: req.params.id });
   if (!cur) throw new HttpError(404, 'Order not found.');
-  if (cur.adminConfirmed) return res.json({ ok: true, order: adminOrder(cur) }); // already confirmed (idempotent)
+  if (cur.adminConfirmed) return res.json({ ok: true, order: adminOrder(cur) });
   throw new HttpError(409, cur.paymentStatus === 'cancelled' ? 'This order was cancelled.' : 'Payment has not been received for this order yet.');
 }));
 
@@ -904,7 +908,7 @@ admin.post('/orders/:id/reject', wrap(async (req, res) => {
     },
     { returnDocument: 'after' }
   );
-  if (o) return res.json({ ok: true, order: adminOrder(o) }); // NB: refunds for paid orders are handled manually in M-Pesa
+  if (o) return res.json({ ok: true, order: adminOrder(o) });
 
   const cur = await col.orders.findOne({ _id: req.params.id });
   if (!cur) throw new HttpError(404, 'Order not found.');
@@ -981,7 +985,7 @@ async function start() {
   server = app.listen(CFG.port, () => {
     console.log(`✅ Maricopa API listening on :${CFG.port}  (db: ${CFG.dbName}, M-Pesa: ${mpesaConfigured() ? CFG.mpesa.env : 'not configured'})`);
   });
-  server.keepAliveTimeout = 65_000; // above typical proxy idle timeouts
+  server.keepAliveTimeout = 65_000;
 }
 
 async function shutdown(signal) {
