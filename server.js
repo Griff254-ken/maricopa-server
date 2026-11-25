@@ -1,27 +1,5 @@
 'use strict';
-/* =====================================================================
-   Maricopa Concrete & Allied — backend
-   Express + MongoDB Atlas (mongoose) + Safaricom Daraja (M-Pesa STK Push)
 
-   Endpoints (match index.html and admin.html exactly)
-
-   PUBLIC
-     GET  /health
-     GET  /api/products
-     POST /api/orders                      (needs Idempotency-Key header)
-     POST /api/mpesa/stkpush
-     GET  /api/orders/:id/status
-   DARAJA (called by Safaricom)
-     POST /api/pay/callback/:secret
-   ADMIN (HTTP Basic auth)
-     GET    /api/admin/products
-     POST   /api/admin/products
-     PUT    /api/admin/products/:id
-     DELETE /api/admin/products/:id
-     GET    /api/admin/orders?status=all|paid|pending|cancelled|released
-     POST   /api/admin/orders/:id/confirm
-     POST   /api/admin/orders/:id/reject
-   ===================================================================== */
 require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
