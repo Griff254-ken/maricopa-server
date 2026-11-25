@@ -1,1009 +1,703 @@
 'use strict';
 /* =====================================================================
-   MARICOPA CONCRETE & ALLIED — BACKEND
-   Express + MongoDB Atlas + Safaricom Daraja (M-Pesa STK Push)
+   Maricopa Concrete & Allied — backend
+   Express + MongoDB Atlas (mongoose) + Safaricom Daraja (M-Pesa STK Push)
 
-   Serves both frontends:
-     • index.html  (storefront)  → public endpoints
-     • admin.html  (admin panel) → /api/admin/* (HTTP Basic auth)
+   Endpoints (match index.html and admin.html exactly)
 
-   Payment flow
-     1. Storefront POST /api/orders           → server re-prices, creates order
-     2. Storefront POST /api/mpesa/stkpush    → Daraja prompt sent to phone
-     3. Safaricom   POST /api/payments/callback/:secret
-                                              → order.paymentStatus = "paid"
-     4. Admin       POST /api/admin/orders/:id/confirm
-                                              → order.adminConfirmed = true
-     5. Storefront polls GET /api/orders/:id/status and only shows
-        "Order confirmed" when paid AND adminConfirmed are both true.
+   PUBLIC
+     GET  /health
+     GET  /api/products
+     POST /api/orders                      (needs Idempotency-Key header)
+     POST /api/mpesa/stkpush
+     GET  /api/orders/:id/status
+   DARAJA (called by Safaricom)
+     POST /api/pay/callback/:secret
+   ADMIN (HTTP Basic auth)
+     GET    /api/admin/products
+     POST   /api/admin/products
+     PUT    /api/admin/products/:id
+     DELETE /api/admin/products/:id
+     GET    /api/admin/orders?status=all|paid|pending|cancelled|released
+     POST   /api/admin/orders/:id/confirm
+     POST   /api/admin/orders/:id/reject
    ===================================================================== */
-
 require('dotenv').config();
+const crypto = require('crypto');
+const express = require('express');
+const mongoose = require('mongoose');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 
-const crypto      = require('node:crypto');
-const path        = require('node:path');
-const fs          = require('node:fs');
-const express     = require('express');
-const cors        = require('cors');
-const helmet      = require('helmet');
-const compression = require('compression');
-const rateLimit   = require('express-rate-limit');
-const { MongoClient, ServerApiVersion, Binary } = require('mongodb');
-
-/* =====================================================================
-   CONFIG
-   ===================================================================== */
 const env = process.env;
-const IS_PROD = env.NODE_ENV === 'production';
-const flag = (v, d = false) => (v === undefined || v === '' ? d : /^(1|true|yes|on)$/i.test(v));
-const list = v => (v || '').split(',').map(s => s.trim()).filter(Boolean);
+const PORT = Number(env.PORT) || 3000;
 
-const parseTrustProxy = v => {
-  if (v === undefined || v === '') return 1;
-  if (/^\d+$/.test(v)) return Number(v);
-  if (/^(true|false)$/i.test(v)) return /^true$/i.test(v);
-  return v;
+const DARAJA = {
+  env: (env.DARAJA_ENV || 'sandbox').toLowerCase() === 'production' ? 'production' : 'sandbox',
+  key: env.DARAJA_CONSUMER_KEY || '',
+  secret: env.DARAJA_CONSUMER_SECRET || '',
+  shortcode: env.DARAJA_SHORTCODE || '',
+  passkey: env.DARAJA_PASSKEY || '',
+  txType: env.DARAJA_TRANSACTION_TYPE || 'CustomerPayBillOnline', // or CustomerBuyGoodsOnline
+  partyB: env.DARAJA_PARTYB || env.DARAJA_SHORTCODE || '',        // till number for Buy Goods
+  publicUrl: (env.PUBLIC_URL || '').replace(/\/+$/, ''),
+  cbSecret: env.CALLBACK_SECRET || ''
 };
+DARAJA.base = DARAJA.env === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
+const darajaReady = () =>
+  !!(DARAJA.key && DARAJA.secret && DARAJA.shortcode && DARAJA.passkey && DARAJA.publicUrl && DARAJA.cbSecret);
 
-const CFG = {
-  port: Number(env.PORT) || 3000,
-  mongoUri: env.MONGODB_URI,
-  dbName: env.MONGODB_DB || 'maricopa',
-  publicUrl: (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''),
-  collectionPrefix: env.COLLECTION_PREFIX ?? 'store_',
-  allowedOrigins: list(env.ALLOWED_ORIGINS).map(o => o.replace(/\/+$/, '')),
-  trustProxy: parseTrustProxy(env.TRUST_PROXY),
-  seedDemo: flag(env.SEED_DEMO_PRODUCTS, false),
-  admin: { user: env.ADMIN_USERNAME || '', pass: env.ADMIN_PASSWORD || '' },
-  mpesa: {
-    env: env.MPESA_ENV === 'production' ? 'production' : 'sandbox',
-    key: env.MPESA_CONSUMER_KEY || '',
-    secret: env.MPESA_CONSUMER_SECRET || '',
-    shortcode: env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
-    passkey: env.MPESA_PASSKEY || (env.MPESA_ENV === 'production' ? '' : 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'),
-    partyB: env.MPESA_PARTY_B || env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
-    txType: env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
-    callbackSecret: env.MPESA_CALLBACK_SECRET || '',
-    testPhone: normPhone(env.MPESA_TEST_PHONE || ''),
-    callbackIps: list(env.MPESA_CALLBACK_IPS),
-    reconcile: flag(env.MPESA_RECONCILE, true),
-    maxAttempts: 8,
-    minRetryMs: 25_000
-  }
-};
-
-// No MPESA_CALLBACK_SECRET set? Derive a stable private one from your consumer secret.
-if (!CFG.mpesa.callbackSecret && CFG.mpesa.secret) {
-  CFG.mpesa.callbackSecret = crypto.createHmac('sha256', CFG.mpesa.secret).update('maricopa-callback').digest('hex').slice(0, 40);
-}
-CFG.mpesa.base = CFG.mpesa.env === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
-
-function assertConfig() {
-  const errors = [];
-  if (!CFG.mongoUri) errors.push('MONGODB_URI is required.');
-  if (!CFG.admin.user || !CFG.admin.pass) errors.push('ADMIN_USERNAME and ADMIN_PASSWORD are required.');
-  if (IS_PROD && CFG.admin.pass.length < 10) errors.push('ADMIN_PASSWORD must be at least 10 characters in production.');
-  if (errors.length) {
-    console.error('\nConfiguration error:\n - ' + errors.join('\n - ') + '\n');
-    process.exit(1);
-  }
-  if (CFG.mpesa.testPhone) {
-    console.warn(`⚠️  MPESA_TEST_PHONE is set: every M-Pesa prompt goes to ${CFG.mpesa.testPhone}, whatever number the customer enters. Remove it before going live.`);
-  }
-  if (env.MPESA_TEST_PHONE && !CFG.mpesa.testPhone) {
-    console.warn('⚠️  MPESA_TEST_PHONE is not a valid Safaricom number and was ignored.');
-  }
-  if (!mpesaConfigured()) {
-    const m = CFG.mpesa;
-    const missing = [
-      !m.key && 'MPESA_CONSUMER_KEY', !m.secret && 'MPESA_CONSUMER_SECRET',
-      !m.shortcode && 'MPESA_SHORTCODE', !m.passkey && 'MPESA_PASSKEY',
-      !CFG.publicUrl && 'PUBLIC_URL'
-    ].filter(Boolean);
-    console.warn(`⚠️  M-Pesa disabled — missing environment variable(s): ${missing.join(', ')}. Add them in your host's Environment settings (Render → Environment). STK push returns 503 until then.`);
-  }
-  if (IS_PROD && !CFG.allowedOrigins.length) {
-    console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it to your storefront/admin origins.');
-  }
-  if (IS_PROD && CFG.publicUrl && !CFG.publicUrl.startsWith('https://')) {
-    console.warn('⚠️  PUBLIC_URL should be https:// (Daraja only calls back to HTTPS URLs).');
-  }
-}
-
-/* =====================================================================
-   SMALL UTILITIES
-   ===================================================================== */
+/* ---------------- Helpers ---------------- */
 class HttpError extends Error {
-  constructor(status, message) {
-    super(message);
-    this.status = status;
-    this.expose = true;
-  }
+  constructor(status, message) { super(message); this.status = status; }
 }
-
-const wrap = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+const ah = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 const sha256 = s => crypto.createHash('sha256').update(s).digest();
-const safeEqual = (a, b) => crypto.timingSafeEqual(sha256(String(a)), sha256(String(b)));
-const round2 = n => Math.round(n * 100) / 100;
-const isObj = v => v && typeof v === 'object' && !Array.isArray(v);
-
-function str(v, { min = 0, max = 255, required = false, field = 'Field' } = {}) {
-  if (v === undefined || v === null || v === '') {
-    if (required) throw new HttpError(400, `${field} is required.`);
-    return '';
-  }
-  if (typeof v !== 'string') throw new HttpError(400, `${field} must be text.`);
-  const s = v.replace(/[\u0000-\u001F\u007F]/g, ' ').replace(/\s+/g, ' ').trim();
-  if (required && !s) throw new HttpError(400, `${field} is required.`);
-  if (s && s.length < min) throw new HttpError(400, `${field} is too short.`);
-  if (s.length > max) throw new HttpError(400, `${field} is too long (max ${max} characters).`);
-  return s;
-}
-
-function num(v, { min = -Infinity, max = Infinity, field = 'Value' } = {}) {
-  const n = typeof v === 'string' && v.trim() !== '' ? Number(v) : v;
-  if (typeof n !== 'number' || !Number.isFinite(n) || n < min || n > max) {
-    throw new HttpError(400, `${field} is invalid.`);
-  }
-  return n;
-}
+const safeEq = (a, b) => crypto.timingSafeEqual(sha256(String(a)), sha256(String(b)));
+const str = (v, max) => String(v ?? '').trim().slice(0, max);
+const isObjectId = v => typeof v === 'string' && /^[a-f\d]{24}$/i.test(v);
 
 function normPhone(v) {
-  if (typeof v !== 'string') return null;
-  v = v.replace(/[\s\-+()]/g, '');
+  v = String(v || '').replace(/[\s\-+()]/g, '');
   if (/^0[17]\d{8}$/.test(v)) return '254' + v.slice(1);
   if (/^254[17]\d{8}$/.test(v)) return v;
   if (/^[17]\d{8}$/.test(v)) return '254' + v;
   return null;
 }
 
-const REF_ALPHABET = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // 32 chars, no I/O/0/1
-const makeReference = () => 'MCA-' + Array.from(crypto.randomBytes(6), b => REF_ALPHABET[b % 32]).join(''); // ≤12 chars (Daraja AccountReference limit)
+const REF_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+function newReference() { // "MCA-" + 8 chars = 12 chars (fits Daraja AccountReference limit)
+  let r = 'MCA-';
+  for (let i = 0; i < 8; i++) r += REF_CHARS[crypto.randomInt(REF_CHARS.length)];
+  return r;
+}
 
-const baseUrl = req => CFG.publicUrl || `${req.protocol}://${req.get('host')}`;
+/* ---------------- Models ---------------- */
+const ProductSchema = new mongoose.Schema({
+  name: { type: String, required: true, trim: true, maxlength: 120 },
+  category: { type: String, default: 'Other', trim: true, maxlength: 60 },
+  emoji: { type: String, default: '📦', maxlength: 8 },
+  unit: { type: String, required: true, trim: true, maxlength: 40 },
+  price: { type: Number, required: true, min: 0 },
+  description: { type: String, default: '', maxlength: 1000 },
+  gradient: { type: [String], default: ['#64748b', '#334155'] },
+  image: { type: String, default: '' },
+  inStock: { type: Boolean, default: true },
+  specs: { type: [[String]], default: [] },
+  options: {
+    type: [{
+      _id: false,
+      key: { type: String, required: true },
+      choices: [{ _id: false, value: { type: String, required: true }, priceAdjust: { type: Number, default: 0 } }]
+    }],
+    default: []
+  }
+}, { timestamps: true });
 
-/* =====================================================================
-   DATABASE
-   ===================================================================== */
-let client;
-let db;
-const col = {};
+const OrderSchema = new mongoose.Schema({
+  id: { type: String, default: () => crypto.randomUUID(), unique: true, index: true },
+  reference: { type: String, unique: true, index: true },
+  idempotencyKey: { type: String },
+  requestHash: String,
+  customer: { name: String, phone: String, location: String },
+  items: [{
+    _id: false,
+    productId: String,
+    name: String,
+    quantity: Number,
+    unitPrice: Number,
+    lineTotal: Number,
+    options: [{ _id: false, key: String, value: String }],
+    note: { type: String, default: '' }
+  }],
+  total: { type: Number, required: true },
+  paymentStatus: { type: String, enum: ['pending', 'paid', 'failed', 'cancelled'], default: 'pending', index: true },
+  paymentMessage: { type: String, default: '' },
+  adminConfirmed: { type: Boolean, default: false },
+  confirmedAt: Date,
+  confirmedBy: String,
+  cancelledAt: Date,
+  paidAt: Date,
+  paidVia: String,
+  mpesaReceipt: { type: String, default: '' },
+  payerPhone: String,
+  // Daraja bookkeeping
+  stkRequestedAt: { type: Date, default: null },
+  lastQueryAt: { type: Date, default: null },
+  stkAttempts: { type: Number, default: 0 },
+  merchantRequestId: String,
+  checkoutRequestId: String,
+  checkoutRequestIds: { type: [String], index: true },
+  needsReview: { type: Boolean, default: false },
+  reviewNote: String
+}, { timestamps: true });
+OrderSchema.index({ idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } });
+OrderSchema.index({ createdAt: -1 });
 
-async function connectDb() {
-  client = new MongoClient(CFG.mongoUri, {
-    serverApi: { version: ServerApiVersion.v1, deprecationErrors: true },
-    maxPoolSize: 10,
-    serverSelectionTimeoutMS: 10_000,
-    retryWrites: true
+const Product = mongoose.model('Product', ProductSchema);
+const Order = mongoose.model('Order', OrderSchema);
+
+/* ---------------- Mappers ---------------- */
+const productOut = p => ({
+  id: String(p._id),
+  name: p.name,
+  category: p.category,
+  emoji: p.emoji,
+  unit: p.unit,
+  price: p.price,
+  description: p.description,
+  gradient: p.gradient,
+  image: p.image,
+  inStock: p.inStock,
+  specs: p.specs || [],
+  options: (p.options || []).map(o => ({
+    key: o.key,
+    choices: (o.choices || []).map(c => ({ value: c.value, priceAdjust: c.priceAdjust || 0 }))
+  }))
+});
+
+const orderOut = o => ({
+  id: o.id,
+  reference: o.reference,
+  customer: o.customer,
+  items: (o.items || []).map(i => ({
+    productId: i.productId,
+    name: i.name,
+    quantity: i.quantity,
+    unitPrice: i.unitPrice,
+    lineTotal: i.lineTotal,
+    options: Object.fromEntries((i.options || []).map(x => [x.key, x.value])),
+    note: i.note || ''
+  })),
+  total: o.total,
+  paymentStatus: o.paymentStatus,
+  paymentMessage: o.paymentMessage || '',
+  adminConfirmed: !!o.adminConfirmed,
+  mpesaReceipt: o.mpesaReceipt || '',
+  needsReview: !!o.needsReview,
+  createdAt: o.createdAt,
+  paidAt: o.paidAt || null,
+  confirmedAt: o.confirmedAt || null
+});
+
+/* ---------------- Product validation ---------------- */
+function cleanProduct(b) {
+  if (!b || typeof b !== 'object') throw new HttpError(400, 'Invalid product data.');
+  const name = str(b.name, 120);
+  if (!name) throw new HttpError(400, 'Product name is required.');
+  const unit = str(b.unit, 40);
+  if (!unit) throw new HttpError(400, 'Unit is required.');
+  const price = Number(b.price);
+  if (b.price === '' || b.price === null || !Number.isFinite(price) || price < 0 || price > 1e9)
+    throw new HttpError(400, 'Price must be a number of 0 or more.');
+
+  let image = typeof b.image === 'string' ? b.image.trim() : '';
+  if (image) {
+    const okData = /^data:image\/(png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(image);
+    const okUrl = /^https:\/\/\S+$/i.test(image);
+    if (!okData && !okUrl) throw new HttpError(400, 'Image must be an uploaded photo or an https link.');
+    if (image.length > 2_000_000) throw new HttpError(413, 'That photo is too large. Try a smaller one.');
+  }
+
+  const gradient = Array.isArray(b.gradient) && b.gradient.length === 2 &&
+    b.gradient.every(c => typeof c === 'string' && /^#[0-9a-f]{3,8}$/i.test(c))
+    ? b.gradient : ['#64748b', '#334155'];
+
+  const specs = (Array.isArray(b.specs) ? b.specs : [])
+    .filter(Array.isArray)
+    .map(s => [str(s[0], 60), str(s[1], 120)])
+    .filter(s => s[0] && s[1])
+    .slice(0, 30);
+
+  const options = (Array.isArray(b.options) ? b.options : []).slice(0, 10).map(g => ({
+    key: str(g && g.key, 60),
+    choices: (Array.isArray(g && g.choices) ? g.choices : []).slice(0, 20).map(c => ({
+      value: str(c && c.value, 80),
+      priceAdjust: Number.isFinite(Number(c && c.priceAdjust)) ? Number(c.priceAdjust) : 0
+    })).filter(c => c.value)
+  })).filter(g => g.key && g.choices.length);
+
+  return {
+    name, unit, price,
+    category: str(b.category, 60) || 'Other',
+    description: str(b.description, 1000),
+    emoji: str(b.emoji, 8) || '📦',
+    inStock: b.inStock !== false && b.inStock !== 'false',
+    image, gradient, specs, options
+  };
+}
+
+/* ---------------- Daraja ---------------- */
+let tokenCache = { token: null, exp: 0 };
+async function darajaToken(force) {
+  if (!force && tokenCache.token && Date.now() < tokenCache.exp) return tokenCache.token;
+  const basic = Buffer.from(`${DARAJA.key}:${DARAJA.secret}`).toString('base64');
+  const r = await fetch(`${DARAJA.base}/oauth/v1/generate?grant_type=client_credentials`, {
+    headers: { Authorization: `Basic ${basic}` },
+    signal: AbortSignal.timeout(20000)
   });
-  await client.connect();
-  db = client.db(CFG.dbName);
-
-  const pf = CFG.collectionPrefix;
-  col.products  = db.collection(pf + 'products');
-  col.images    = db.collection(pf + 'product_images');
-  col.orders    = db.collection(pf + 'orders');
-  col.callbacks = db.collection(pf + 'payment_callbacks');
-
-  const ensure = async (collection, key, options) => {
-    try {
-      await collection.createIndex(key, options);
-    } catch (e) {
-      console.warn(`⚠️  Index "${options.name}" on ${collection.collectionName} skipped: ${e.message}`);
-    }
-  };
-
-  await Promise.all([
-    ensure(col.products, { category: 1, name: 1 }, { name: 'mca_category_name' }),
-    ensure(col.orders, { reference: 1 }, { name: 'mca_reference_unique', unique: true }),
-    ensure(col.orders, { createdAt: -1 }, { name: 'mca_created' }),
-    ensure(col.orders, { paymentStatus: 1, adminConfirmed: 1, createdAt: -1 }, { name: 'mca_status_created' }),
-    ensure(col.orders, { checkoutRequestIds: 1 }, { name: 'mca_checkout_ids' }),
-    ensure(col.orders, { idempotencyKey: 1 }, { name: 'mca_idem_unique', unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }),
-    ensure(col.orders, { mpesaReceipt: 1 }, { name: 'mca_receipt_unique', unique: true, partialFilterExpression: { mpesaReceipt: { $type: 'string' } } }),
-    ensure(col.callbacks, { receivedAt: 1 }, { name: 'mca_callbacks_ttl', expireAfterSeconds: 90 * 24 * 3600 })
-  ]);
-
-  if (CFG.seedDemo && (await col.products.estimatedDocumentCount()) === 0) {
-    const now = new Date();
-    await col.products.insertMany(SEED.map(p => ({
-      _id: crypto.randomUUID(), image: null, inStock: true, createdAt: now, updatedAt: now, ...p
-    })));
-    console.log(`Seeded ${SEED.length} demo products (replace prices from the admin panel).`);
-  }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok || !d.access_token) throw new Error('Daraja auth failed (' + r.status + ')');
+  tokenCache = { token: d.access_token, exp: Date.now() + (Number(d.expires_in) || 3599) * 1000 - 60000 };
+  return tokenCache.token;
 }
-
-const SEED = [
-  {
-    name: 'Ready-Mix Concrete C25', category: 'Concrete', unit: 'per m³', price: 14500, emoji: '🏗️',
-    description: 'Batched, tested C25/30 ready-mix concrete delivered to site.',
-    gradient: ['#64748b', '#334155'],
-    specs: [['Grade', 'C25/30'], ['Max aggregate', '20 mm']],
-    options: [{ key: 'Slump', choices: [{ value: '75–100 mm', priceAdjust: 0 }, { value: '100–150 mm', priceAdjust: 300 }] }]
-  },
-  {
-    name: 'Portland Cement 50kg', category: 'Cement', unit: 'per bag', price: 800, emoji: '🧱',
-    description: 'General-purpose Portland cement, 50 kg bag.',
-    gradient: ['#94a3b8', '#475569'],
-    specs: [['Weight', '50 kg'], ['Class', '42.5N']], options: []
-  },
-  {
-    name: 'Ballast 3/4"', category: 'Aggregates', unit: 'per tonne', price: 2200, emoji: '⛰️',
-    description: 'Crushed stone ballast for concrete and bases.',
-    gradient: ['#78716c', '#44403c'], specs: [['Size', '3/4 inch']], options: []
-  },
-  {
-    name: 'Hollow Block 6"', category: 'Blocks', unit: 'per block', price: 75, emoji: '🧱',
-    description: 'Machine-cut hollow concrete block for walling.',
-    gradient: ['#a8a29e', '#57534e'], specs: [['Size', '6 inch']], options: []
-  }
-];
-
-/* =====================================================================
-   PRODUCTS — validation & mapping
-   ===================================================================== */
-const HEX = /^#[0-9a-f]{3,8}$/i;
-
-function sanitizeProduct(b) {
-  if (!isObj(b)) throw new HttpError(400, 'Invalid product data.');
-
-  const gradient = Array.isArray(b.gradient) && b.gradient.length === 2 && b.gradient.every(c => typeof c === 'string' && HEX.test(c.trim()))
-    ? b.gradient.map(c => c.trim())
-    : ['#64748b', '#334155'];
-
-  const specs = (Array.isArray(b.specs) ? b.specs.slice(0, 30) : [])
-    .map(s => (Array.isArray(s) ? [str(s[0], { max: 60, field: 'Spec label' }), str(s[1], { max: 120, field: 'Spec value' })] : null))
-    .filter(s => s && s[0] && s[1]);
-
-  const rawOpts = Array.isArray(b.options) ? b.options : [];
-  if (rawOpts.length > 10) throw new HttpError(400, 'Too many option groups (max 10).');
-  const options = [];
-  const seenKeys = new Set();
-  for (const g of rawOpts) {
-    if (!isObj(g)) continue;
-    const key = str(g.key, { max: 60, field: 'Option name' });
-    if (!key) continue;
-    if (seenKeys.has(key)) throw new HttpError(400, `Duplicate option group "${key}".`);
-    seenKeys.add(key);
-    const seen = new Set();
-    const choices = [];
-    for (const c of (Array.isArray(g.choices) ? g.choices.slice(0, 30) : [])) {
-      if (!isObj(c)) continue;
-      const value = str(c.value, { max: 80, field: 'Option value' });
-      if (!value) continue;
-      if (seen.has(value)) throw new HttpError(400, `Duplicate choice "${value}" in "${key}".`);
-      seen.add(value);
-      const priceAdjust = c.priceAdjust === undefined || c.priceAdjust === '' ? 0 : num(c.priceAdjust, { min: -10_000_000, max: 10_000_000, field: 'Price adjustment' });
-      choices.push({ value, priceAdjust });
-    }
-    if (choices.length) options.push({ key, choices });
-  }
-
-  return {
-    name: str(b.name, { max: 120, required: true, field: 'Product name' }),
-    category: str(b.category, { max: 60, field: 'Category' }) || 'Other',
-    unit: str(b.unit, { max: 40, required: true, field: 'Unit' }),
-    price: num(b.price, { min: 0, max: 100_000_000, field: 'Price' }),
-    description: str(b.description, { max: 1000, field: 'Description' }),
-    emoji: str(b.emoji, { max: 8, field: 'Emoji' }) || '📦',
-    inStock: b.inStock === undefined ? true : b.inStock === true || b.inStock === 'true',
-    gradient,
-    specs,
-    options
-  };
-}
-
-const MAX_IMAGE_BYTES = 2.5 * 1024 * 1024;
-
-function detectImageType(buf) {
-  if (buf.length < 12) return null;
-  if (buf[0] === 0x89 && buf.toString('ascii', 1, 4) === 'PNG') return 'image/png';
-  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'image/jpeg';
-  if (buf.toString('ascii', 0, 4) === 'GIF8') return 'image/gif';
-  if (buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'image/webp';
-  return null;
-}
-
-/**
- * Interprets the `image` field sent by admin.html.
- *   undefined      → keep the current image (only on PUT)
- *   "" or null     → clear the image
- *   data:...       → upload (base64)
- *   our own URL    → keep the current image
- *   any other URL  → store as-is
- */
-function parseImageInput(input, productId) {
-  if (input === undefined) return { action: 'keep' };
-  if (input === null || input === '') return { action: 'clear' };
-  if (typeof input !== 'string') throw new HttpError(400, 'Invalid image.');
-
-  if (input.startsWith('data:')) {
-    const comma = input.indexOf(',');
-    const header = comma > 0 ? input.slice(0, comma) : '';
-    if (!/^data:image\/(png|jpe?g|webp|gif);base64$/i.test(header)) {
-      throw new HttpError(400, 'Image must be a PNG, JPG, WebP or GIF.');
-    }
-    const buf = Buffer.from(input.slice(comma + 1), 'base64');
-    if (buf.length > MAX_IMAGE_BYTES) throw new HttpError(413, 'Image is too large (max 2 MB).');
-    const contentType = detectImageType(buf);
-    if (!contentType) throw new HttpError(400, 'Image file is not valid.');
-    return { action: 'upload', buf, contentType };
-  }
-
-  let u;
-  try { u = new URL(input); } catch { throw new HttpError(400, 'Invalid image URL.'); }
-  if (!/^https?:$/.test(u.protocol) || input.length > 2000) throw new HttpError(400, 'Invalid image URL.');
-  const own = /\/api\/products\/([^/]+)\/image\/?$/.exec(u.pathname);
-  if (own) {
-    if (decodeURIComponent(own[1]) === productId) return { action: 'keep' };
-    throw new HttpError(400, 'Invalid image URL.');
-  }
-  return { action: 'url', url: input };
-}
-
-async function applyImage(productId, img) {
-  if (img.action === 'upload') {
-    const hash = crypto.createHash('sha1').update(img.buf).digest('hex').slice(0, 16);
-    await col.images.updateOne(
-      { _id: productId },
-      { $set: { contentType: img.contentType, data: new Binary(img.buf), hash, size: img.buf.length, updatedAt: new Date() } },
-      { upsert: true }
-    );
-    return { kind: 'upload', hash };
-  }
-  await col.images.deleteOne({ _id: productId });
-  if (img.action === 'url') return { kind: 'url', url: img.url };
-  return null; // clear
-}
-
-function publicProduct(req, p) {
-  let image = '';
-  if (p.image?.kind === 'url') image = p.image.url;
-  else if (p.image?.kind === 'upload') image = `${baseUrl(req)}/api/products/${encodeURIComponent(p._id)}/image?v=${p.image.hash}`;
-  return {
-    id: p._id,
-    name: p.name,
-    category: p.category,
-    unit: p.unit,
-    price: p.price,
-    description: p.description,
-    image,
-    inStock: p.inStock !== false,
-    emoji: p.emoji,
-    gradient: p.gradient,
-    specs: p.specs || [],
-    options: p.options || []
-  };
-}
-
-/* =====================================================================
-   ORDERS — pricing & mapping
-   ===================================================================== */
-const stepOf = unit => (/m³/.test(unit) ? 0.5 : 1); // must match the storefront
-
-async function priceOrder(body) {
-  if (!isObj(body)) throw new HttpError(400, 'Invalid order.');
-  const c = body.customer;
-  if (!isObj(c)) throw new HttpError(400, 'Customer details are required.');
-  const phone = normPhone(c.phone);
-  if (!phone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
-  const customer = {
-    name: str(c.name, { min: 2, max: 80, required: true, field: 'Name' }),
-    phone,
-    location: str(c.location, { min: 2, max: 200, required: true, field: 'Delivery location' })
-  };
-
-  if (!Array.isArray(body.items) || !body.items.length) throw new HttpError(400, 'Your cart is empty.');
-  if (body.items.length > 50) throw new HttpError(400, 'Too many items in one order (max 50).');
-
-  const ids = [...new Set(body.items.map(i => (isObj(i) && typeof i.productId === 'string' ? i.productId : null)))];
-  if (ids.includes(null) || ids.some(id => id.length > 64)) throw new HttpError(400, 'Invalid item in cart.');
-  const found = await col.products.find({ _id: { $in: ids } }).toArray();
-  const byId = new Map(found.map(p => [p._id, p]));
-
-  const items = body.items.map(it => {
-    const p = byId.get(it.productId);
-    if (!p) throw new HttpError(409, 'An item in your cart is no longer available. Please refresh the page.');
-    if (p.inStock === false) throw new HttpError(409, `${p.name} is out of stock.`);
-
-    const quantity = num(it.quantity, { min: 0.5, max: 100_000, field: `Quantity for ${p.name}` });
-    const step = stepOf(p.unit);
-    if (Math.abs(quantity / step - Math.round(quantity / step)) > 1e-9) {
-      throw new HttpError(400, `Quantity for ${p.name} must be in steps of ${step}.`);
-    }
-
-    const chosen = isObj(it.options) ? it.options : {};
-    const options = {};
-    let unitPrice = p.price;
-    for (const g of p.options || []) {
-      const want = chosen[g.key];
-      const choice = want === undefined ? g.choices[0] : g.choices.find(x => typeof want === 'string' && x.value === want);
-      if (!choice) throw new HttpError(409, `The "${g.key}" option for ${p.name} has changed. Please refresh the page.`);
-      options[g.key] = choice.value;
-      unitPrice += choice.priceAdjust || 0;
-    }
-    if (unitPrice < 0) throw new HttpError(409, `${p.name} has an invalid price. Please contact us.`);
-
-    return {
-      productId: p._id,
-      name: p.name,
-      unit: p.unit,
-      quantity,
-      options,
-      note: str(it.note, { max: 200, field: 'Note' }),
-      unitPrice: round2(unitPrice),
-      lineTotal: round2(unitPrice * quantity)
-    };
-  });
-
-  const total = Math.round(items.reduce((s, i) => s + i.lineTotal, 0)); // whole shillings (M-Pesa requirement)
-  if (total < 1) throw new HttpError(400, 'Order total must be at least KSh 1.');
-  return { customer, items, total };
-}
-
-function adminOrder(o) {
-  return {
-    id: o._id,
-    reference: o.reference,
-    customer: o.customer,
-    items: o.items,
-    total: o.total,
-    paymentStatus: o.paymentStatus,
-    adminConfirmed: !!o.adminConfirmed,
-    mpesaReceipt: o.mpesaReceipt || null,
-    createdAt: o.createdAt,
-    confirmedAt: o.confirmedAt || null
-  };
-}
-
-/* =====================================================================
-   DARAJA (M-PESA)
-   ===================================================================== */
-function mpesaConfigured() {
-  const m = CFG.mpesa;
-  return !!(m.key && m.secret && m.shortcode && m.passkey && m.callbackSecret && CFG.publicUrl);
-}
-
-const darajaTimestamp = () => new Date(Date.now() + 3 * 3600 * 1000).toISOString().replace(/[-:T]/g, '').slice(0, 14); // EAT
-const darajaPassword = ts => Buffer.from(CFG.mpesa.shortcode + CFG.mpesa.passkey + ts).toString('base64');
-
-let tokenCache = { value: null, exp: 0, pending: null };
-
-async function getToken(force = false) {
-  if (!force && tokenCache.value && Date.now() < tokenCache.exp) return tokenCache.value;
-  if (tokenCache.pending) return tokenCache.pending;
-  tokenCache.pending = (async () => {
-    try {
-      const basic = Buffer.from(`${CFG.mpesa.key}:${CFG.mpesa.secret}`).toString('base64');
-      const res = await fetch(`${CFG.mpesa.base}/oauth/v1/generate?grant_type=client_credentials`, {
-        headers: { Authorization: `Basic ${basic}` },
-        signal: AbortSignal.timeout(15_000)
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok || !data.access_token) throw new Error(`Daraja auth failed (${res.status})`);
-      tokenCache.value = data.access_token;
-      tokenCache.exp = Date.now() + Math.max(60, (Number(data.expires_in) || 3599) - 60) * 1000;
-      return tokenCache.value;
-    } finally {
-      tokenCache.pending = null;
-    }
-  })();
-  return tokenCache.pending;
-}
-
-async function darajaPost(pathname, body, retried = false) {
-  const token = await getToken(retried);
-  const res = await fetch(CFG.mpesa.base + pathname, {
+async function darajaPost(path, payload, retried) {
+  const token = await darajaToken(!!retried);
+  const r = await fetch(DARAJA.base + path, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000)
+    body: JSON.stringify(payload),
+    signal: AbortSignal.timeout(25000)
   });
-  const data = await res.json().catch(() => ({}));
-  if (res.status === 401 && !retried) { tokenCache.value = null; return darajaPost(pathname, body, true); }
-  return { ok: res.ok, status: res.status, data };
+  if (r.status === 401 && !retried) return darajaPost(path, payload, true);
+  const data = await r.json().catch(() => ({}));
+  return { ok: r.ok, status: r.status, data };
+}
+const darajaTimestamp = () => new Date(Date.now() + 3 * 3600e3).toISOString().replace(/\D/g, '').slice(0, 14); // EAT
+const darajaPassword = ts => Buffer.from(DARAJA.shortcode + DARAJA.passkey + ts).toString('base64');
+
+function friendlyFailure(code, desc) {
+  switch (Number(code)) {
+    case 1032: return 'You cancelled the M-Pesa request.';
+    case 1: return 'Insufficient M-Pesa balance.';
+    case 2001: return 'Wrong M-Pesa PIN entered.';
+    case 1037: return 'The M-Pesa prompt timed out. Please try again.';
+    case 1025: case 1019: return 'M-Pesa could not send the prompt. Please try again.';
+    default: return desc || 'The M-Pesa payment was not completed.';
+  }
 }
 
-async function sendStkPush(order, phone) {
+/* Handles Safaricom's callback body */
+async function processCallback(body) {
+  const cb = body && body.Body && body.Body.stkCallback;
+  if (!cb || !cb.CheckoutRequestID) return;
+  const checkoutId = String(cb.CheckoutRequestID);
+  const code = Number(cb.ResultCode);
+  const order = await Order.findOne({ checkoutRequestIds: checkoutId });
+  if (!order) { console.warn('[callback] no order for', checkoutId); return; }
+
+  if (code === 0) {
+    const items = (cb.CallbackMetadata && cb.CallbackMetadata.Item) || [];
+    const get = n => (items.find(i => i.Name === n) || {}).Value;
+    const receipt = String(get('MpesaReceiptNumber') || '');
+    const amount = Number(get('Amount'));
+    const phone = get('PhoneNumber') != null ? String(get('PhoneNumber')) : undefined;
+
+    if (order.paymentStatus === 'paid') {
+      if (!order.mpesaReceipt && receipt) await Order.updateOne({ id: order.id }, { $set: { mpesaReceipt: receipt } });
+      return;
+    }
+    if (order.paymentStatus === 'cancelled') {
+      await Order.updateOne({ id: order.id }, { $set: {
+        mpesaReceipt: receipt, paidAt: new Date(), needsReview: true,
+        reviewNote: 'Customer paid after the order was cancelled. Refund required.'
+      } });
+      console.warn('[callback] payment on cancelled order', order.reference, receipt);
+      return;
+    }
+    if (Number.isFinite(amount) && amount + 0.001 < order.total) {
+      await Order.updateOne({ id: order.id }, { $set: {
+        mpesaReceipt: receipt, needsReview: true,
+        reviewNote: `Underpayment: received KSh ${amount}, expected KSh ${order.total}.`
+      } });
+      console.warn('[callback] amount mismatch', order.reference, amount, order.total);
+      return;
+    }
+    await Order.updateOne(
+      { id: order.id, paymentStatus: { $in: ['pending', 'failed'] } },
+      { $set: { paymentStatus: 'paid', paidAt: new Date(), paidVia: 'callback', mpesaReceipt: receipt, payerPhone: phone || order.payerPhone, paymentMessage: '' } }
+    );
+  } else {
+    // only fail the order if this was the latest attempt
+    await Order.updateOne(
+      { id: order.id, paymentStatus: 'pending', checkoutRequestId: checkoutId },
+      { $set: { paymentStatus: 'failed', paymentMessage: friendlyFailure(code, cb.ResultDesc) } }
+    );
+  }
+}
+
+/* If the callback never arrives, ask Daraja directly */
+async function reconcile(order) {
+  if (!darajaReady() || order.paymentStatus !== 'pending' || !order.checkoutRequestId) return;
+  const now = Date.now();
+  if (!order.stkRequestedAt || now - order.stkRequestedAt.getTime() < 25000) return;
+  const claimed = await Order.findOneAndUpdate(
+    { id: order.id, paymentStatus: 'pending', $or: [{ lastQueryAt: null }, { lastQueryAt: { $lt: new Date(now - 15000) } }] },
+    { $set: { lastQueryAt: new Date() } }, { new: true }
+  );
+  if (!claimed) return;
+  try {
+    const ts = darajaTimestamp();
+    const r = await darajaPost('/mpesa/stkpushquery/v1/query', {
+      BusinessShortCode: DARAJA.shortcode,
+      Password: darajaPassword(ts),
+      Timestamp: ts,
+      CheckoutRequestID: order.checkoutRequestId
+    });
+    const code = r.data && r.data.ResultCode;
+    if (code === undefined || code === null || code === '') return; // still processing
+    if (String(code) === '0') {
+      await Order.updateOne(
+        { id: order.id, paymentStatus: 'pending', checkoutRequestId: order.checkoutRequestId },
+        { $set: { paymentStatus: 'paid', paidAt: new Date(), paidVia: 'query' } }
+      );
+    } else {
+      await Order.updateOne(
+        { id: order.id, paymentStatus: 'pending', checkoutRequestId: order.checkoutRequestId },
+        { $set: { paymentStatus: 'failed', paymentMessage: friendlyFailure(code, r.data.ResultDesc) } }
+      );
+    }
+  } catch (e) { console.warn('[reconcile]', e.message); }
+}
+
+/* ---------------- App ---------------- */
+const app = express();
+app.set('trust proxy', 1);
+app.disable('x-powered-by');
+app.use(helmet());
+
+const allowed = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin || !allowed.length || allowed.includes(origin)) return cb(null, true);
+    cb(new HttpError(403, 'This website is not allowed to use the server (add it to ALLOWED_ORIGINS).'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
+  maxAge: 86400
+}));
+app.use(express.json({ limit: '3mb' }));
+
+const limiter = (windowMs, limit, message) =>
+  rateLimit({ windowMs, limit, standardHeaders: true, legacyHeaders: false, message: { error: message } });
+const orderLimiter = limiter(60e3, 20, 'Too many orders. Please wait a minute.');
+const stkLimiter = limiter(60e3, 10, 'Too many payment requests. Please wait a minute.');
+const statusLimiter = limiter(60e3, 60, 'Too many status checks. Please slow down.');
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60e3, limit: 60, skipSuccessfulRequests: true, standardHeaders: true, legacyHeaders: false,
+  message: { error: 'Too many failed attempts. Try again in 15 minutes.' }
+});
+
+/* ---- Health ---- */
+app.get('/', (req, res) => res.json({ name: 'Maricopa server', ok: true }));
+app.get('/health', (req, res) => res.json({
+  status: 'ok',
+  db: mongoose.connection.readyState === 1,
+  mpesa: darajaReady() ? DARAJA.env : 'not configured'
+}));
+
+/* ---- Public: products ---- */
+app.get('/api/products', ah(async (req, res) => {
+  const list = await Product.find().sort({ category: 1, name: 1 }).lean();
+  res.json({ products: list.map(productOut) });
+}));
+
+/* ---- Public: create order ---- */
+app.post('/api/orders', orderLimiter, ah(async (req, res) => {
+  const key = req.get('Idempotency-Key') || '';
+  if (key.length < 8 || key.length > 100) throw new HttpError(400, 'Missing or invalid Idempotency-Key header.');
+  const body = req.body || {};
+  const requestHash = sha256(JSON.stringify(body)).toString('hex');
+
+  const summary = o => ({ orderId: o.id, reference: o.reference, total: o.total, paymentStatus: o.paymentStatus });
+  const prior = await Order.findOne({ idempotencyKey: key });
+  if (prior) {
+    if (prior.requestHash !== requestHash) throw new HttpError(422, 'This Idempotency-Key was already used with different data.');
+    return res.json(summary(prior));
+  }
+
+  // customer
+  const c = body.customer || {};
+  const name = str(c.name, 100), location = str(c.location, 200), phone = normPhone(c.phone);
+  if (name.length < 2) throw new HttpError(400, 'Please enter your name.');
+  if (!phone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
+  if (location.length < 2) throw new HttpError(400, 'Please enter a delivery location.');
+
+  // items
+  const rawItems = Array.isArray(body.items) ? body.items : [];
+  if (!rawItems.length) throw new HttpError(400, 'Your cart is empty.');
+  if (rawItems.length > 50) throw new HttpError(400, 'Too many items in one order.');
+  const ids = [...new Set(rawItems.map(i => i && i.productId))];
+  if (!ids.every(isObjectId)) throw new HttpError(400, 'One of the products in your cart is no longer available.');
+  const prods = await Product.find({ _id: { $in: ids } }).lean();
+  const byId = new Map(prods.map(p => [String(p._id), p]));
+
+  const items = [];
+  let sum = 0;
+  for (const it of rawItems) {
+    const p = byId.get(String(it.productId));
+    if (!p) throw new HttpError(400, 'One of the products in your cart is no longer available.');
+    if (!p.inStock) throw new HttpError(400, `${p.name} is currently out of stock.`);
+
+    const step = /m³/.test(p.unit) ? 0.5 : 1;
+    const q = Number(it.quantity);
+    const ratio = q / step;
+    if (!Number.isFinite(q) || q < step || q > 100000 || Math.abs(ratio - Math.round(ratio)) > 1e-9)
+      throw new HttpError(400, `Invalid quantity for ${p.name}.`);
+
+    const given = it.options && typeof it.options === 'object' && !Array.isArray(it.options) ? it.options : {};
+    const chosen = [];
+    let adj = 0;
+    for (const g of p.options || []) {
+      if (!g.choices || !g.choices.length) continue;
+      const want = typeof given[g.key] === 'string' ? given[g.key] : g.choices[0].value;
+      const ch = g.choices.find(x => x.value === want);
+      if (!ch) throw new HttpError(400, `"${want}" is not available for ${g.key} on ${p.name}. Please refresh the page.`);
+      chosen.push({ key: g.key, value: ch.value });
+      adj += ch.priceAdjust || 0;
+    }
+    const unitPrice = Math.max(0, p.price + adj);
+    const lineTotal = Math.round(unitPrice * q * 100) / 100;
+    sum += lineTotal;
+    items.push({
+      productId: String(p._id), name: p.name, quantity: q, unitPrice, lineTotal,
+      options: chosen, note: str(it.note, 200)
+    });
+  }
+  const total = Math.round(sum);
+  if (total <= 0) throw new HttpError(400, 'Order total must be greater than zero.');
+
+  let order;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      order = await Order.create({
+        reference: newReference(), idempotencyKey: key, requestHash,
+        customer: { name, phone, location }, items, total
+      });
+      break;
+    } catch (e) {
+      if (e && e.code === 11000) {
+        const dup = await Order.findOne({ idempotencyKey: key });
+        if (dup) return res.json(summary(dup));      // concurrent duplicate request
+        continue;                                     // reference collision, retry
+      }
+      throw e;
+    }
+  }
+  if (!order) throw new HttpError(500, 'Could not create the order. Please try again.');
+  res.status(201).json(summary(order));
+}));
+
+/* ---- Public: STK push ---- */
+app.post('/api/mpesa/stkpush', stkLimiter, ah(async (req, res) => {
+  if (!darajaReady()) throw new HttpError(503, 'M-Pesa is not configured on the server yet.');
+  const { orderId, phone } = req.body || {};
+  if (typeof orderId !== 'string' || orderId.length > 64) throw new HttpError(400, 'Missing order.');
+
+  const existing = await Order.findOne({ id: orderId });
+  if (!existing) throw new HttpError(404, 'Order not found.');
+  let ph = existing.customer.phone;
+  if (phone) {
+    ph = normPhone(phone);
+    if (!ph) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
+  }
+
+  // atomically claim the right to send a prompt (stops double-taps / double prompts)
+  const cutoff = new Date(Date.now() - 45000);
+  const order = await Order.findOneAndUpdate(
+    {
+      id: orderId, adminConfirmed: false, paymentStatus: { $in: ['pending', 'failed'] },
+      $or: [{ stkRequestedAt: null }, { stkRequestedAt: { $lt: cutoff } }]
+    },
+    { $set: { paymentStatus: 'pending', paymentMessage: '', stkRequestedAt: new Date(), stkAmount: undefined, payerPhone: ph } },
+    { new: true }
+  );
+  if (!order) {
+    const o = await Order.findOne({ id: orderId });
+    if (!o) throw new HttpError(404, 'Order not found.');
+    if (o.adminConfirmed || o.paymentStatus === 'paid') throw new HttpError(409, 'This order has already been paid.');
+    if (o.paymentStatus === 'cancelled') throw new HttpError(409, 'This order was cancelled.');
+    throw new HttpError(429, 'A payment prompt was just sent. Please wait a moment before trying again.');
+  }
+
+  const release = () => Order.updateOne({ id: orderId }, { $set: { stkRequestedAt: null } }).catch(() => {});
   const ts = darajaTimestamp();
   let r;
   try {
     r = await darajaPost('/mpesa/stkpush/v1/processrequest', {
-      BusinessShortCode: CFG.mpesa.shortcode,
+      BusinessShortCode: DARAJA.shortcode,
       Password: darajaPassword(ts),
       Timestamp: ts,
-      TransactionType: CFG.mpesa.txType,
-      Amount: order.total,
-      PartyA: phone,
-      PartyB: CFG.mpesa.partyB,
-      PhoneNumber: phone,
-      CallBackURL: `${CFG.publicUrl}/api/payments/callback/${CFG.mpesa.callbackSecret}`,
-      AccountReference: order.reference,
-      TransactionDesc: 'Maricopa'
+      TransactionType: DARAJA.txType,
+      Amount: Math.ceil(order.total),
+      PartyA: ph,
+      PartyB: DARAJA.partyB,
+      PhoneNumber: ph,
+      CallBackURL: `${DARAJA.publicUrl}/api/pay/callback/${DARAJA.cbSecret}`,
+      AccountReference: order.reference.slice(0, 12),
+      TransactionDesc: 'Materials'
     });
   } catch (e) {
-    console.error('Daraja STK request failed:', e.message);
-    throw new HttpError(502, 'Could not reach M-Pesa. Please try again in a moment.');
+    await release();
+    console.error('[stkpush]', e.message);
+    throw new HttpError(502, 'Could not reach M-Pesa. Please try again.');
   }
-  const d = r.data || {};
-  if (!r.ok || String(d.ResponseCode) !== '0') {
-    console.error('Daraja STK rejected:', r.status, JSON.stringify(d));
-    throw new HttpError(502, d.CustomerMessage || d.errorMessage || d.ResponseDescription || 'M-Pesa could not send the payment prompt.');
+  if (!r.ok || String(r.data.ResponseCode) !== '0') {
+    await release();
+    console.error('[stkpush] rejected', r.status, JSON.stringify(r.data));
+    throw new HttpError(502, r.data.errorMessage || r.data.CustomerMessage || r.data.ResponseDescription || 'M-Pesa rejected the request.');
   }
-  return { checkoutRequestId: d.CheckoutRequestID, merchantRequestId: d.MerchantRequestID };
-}
-
-const FAIL_MESSAGES = {
-  1: 'Insufficient M-Pesa balance.',
-  1001: 'Another M-Pesa transaction is in progress on your phone. Try again shortly.',
-  1019: 'The M-Pesa request expired. Please try again.',
-  1025: 'M-Pesa could not show the prompt on your phone. Please try again.',
-  1032: 'You cancelled the M-Pesa request.',
-  1037: 'The M-Pesa prompt timed out. Please try again.',
-  2001: 'Wrong M-Pesa PIN entered.'
-};
-const failMessage = (code, desc) => FAIL_MESSAGES[code] || (typeof desc === 'string' && desc.slice(0, 200)) || 'The payment was not completed.';
-
-/** Marks an order paid. Safe to call repeatedly (callback + reconciliation). */
-async function markPaid(order, { receipt, amount, phone, via }) {
-  const now = new Date();
-  const set = { paymentStatus: 'paid', paidAt: now, paidVia: via, failureReason: null, updatedAt: now };
-  if (receipt) set.mpesaReceipt = receipt;
-  if (amount !== undefined) set.paidAmount = amount;
-  if (phone) set.paidPhone = phone;
-
-  try {
-    const r = await col.orders.updateOne({ _id: order._id, paymentStatus: { $in: ['pending', 'failed'] } }, { $set: set });
-    if (r.matchedCount) return;
-
-    const cur = await col.orders.findOne({ _id: order._id });
-    if (!cur) return;
-    if (cur.paymentStatus === 'paid' && receipt && !cur.mpesaReceipt) {
-      await col.orders.updateOne({ _id: cur._id }, { $set: { mpesaReceipt: receipt, paidAmount: amount, paidPhone: phone, updatedAt: now } });
-    } else if (cur.paymentStatus === 'cancelled') {
-      await col.orders.updateOne({ _id: cur._id }, { $set: { lateReceipt: receipt || null, lateReceiptAmount: amount ?? null, updatedAt: now } });
-      console.error(`⚠️  Payment ${receipt} arrived for CANCELLED order ${cur.reference}. Refund required.`);
-    }
-  } catch (e) {
-    if (e.code === 11000) { console.warn('Duplicate M-Pesa receipt ignored:', receipt); return; }
-    throw e;
-  }
-}
-
-async function markFailed(order, checkoutRequestId, reason) {
-  await col.orders.updateOne(
-    { _id: order._id, paymentStatus: 'pending', checkoutRequestId },
-    { $set: { paymentStatus: 'failed', failureReason: reason, updatedAt: new Date() } }
-  );
-}
-
-async function handleStkCallback(body) {
-  const cb = body?.Body?.stkCallback;
-  if (!cb || typeof cb.CheckoutRequestID !== 'string') return;
-
-  await col.callbacks.insertOne({
-    receivedAt: new Date(),
-    checkoutRequestId: cb.CheckoutRequestID,
-    resultCode: cb.ResultCode,
-    resultDesc: cb.ResultDesc,
-    payload: body
+  await Order.updateOne({ id: orderId }, {
+    $set: { merchantRequestId: r.data.MerchantRequestID, checkoutRequestId: r.data.CheckoutRequestID },
+    $addToSet: { checkoutRequestIds: r.data.CheckoutRequestID },
+    $inc: { stkAttempts: 1 }
   });
-
-  const order = await col.orders.findOne({ checkoutRequestIds: cb.CheckoutRequestID });
-  if (!order) { console.warn('Callback for unknown CheckoutRequestID', cb.CheckoutRequestID); return; }
-
-  const code = Number(cb.ResultCode);
-  if (code === 0) {
-    const meta = Array.isArray(cb.CallbackMetadata?.Item) ? cb.CallbackMetadata.Item : [];
-    const get = n => meta.find(i => i.Name === n)?.Value;
-    const receipt = String(get('MpesaReceiptNumber') || '');
-    const amount = Number(get('Amount'));
-    const phone = String(get('PhoneNumber') || '');
-    if (!receipt) { console.error('Success callback without receipt', cb.CheckoutRequestID); return; }
-    if (!(amount >= order.total)) {
-      console.error(`Underpayment on ${order.reference}: expected ${order.total}, got ${amount} (${receipt})`);
-      await col.orders.updateOne({ _id: order._id }, { $set: { paymentStatus: 'failed', failureReason: 'Payment amount did not match the order total. Please contact us.', mpesaReceipt: receipt, paidAmount: amount, updatedAt: new Date() } });
-      return;
-    }
-    await markPaid(order, { receipt, amount, phone, via: 'callback' });
-  } else {
-    await markFailed(order, cb.CheckoutRequestID, failMessage(code, cb.ResultDesc));
-  }
-}
-
-/** If the callback never arrived, ask Daraja directly (throttled). */
-async function reconcileOrder(o) {
-  const cutoff = new Date(Date.now() - 12_000);
-  const claimed = await col.orders.findOneAndUpdate(
-    { _id: o._id, paymentStatus: 'pending', $or: [{ lastQueryAt: null }, { lastQueryAt: { $lt: cutoff } }] },
-    { $set: { lastQueryAt: new Date() } },
-    { returnDocument: 'after' }
-  );
-  if (!claimed) return o;
-
-  const ts = darajaTimestamp();
-  const r = await darajaPost('/mpesa/stkpushquery/v1/query', {
-    BusinessShortCode: CFG.mpesa.shortcode,
-    Password: darajaPassword(ts),
-    Timestamp: ts,
-    CheckoutRequestID: claimed.checkoutRequestId
-  });
-  const d = r.data || {};
-  if (d.ResultCode === undefined) return claimed;
-
-  const code = Number(d.ResultCode);
-  if (code === 0) await markPaid(claimed, { via: 'query' });
-  else await markFailed(claimed, claimed.checkoutRequestId, failMessage(code, d.ResultDesc));
-  return (await col.orders.findOne({ _id: o._id })) || claimed;
-}
-
-/* =====================================================================
-   EXPRESS APP
-   ===================================================================== */
-const app = express();
-app.set('trust proxy', CFG.trustProxy);
-app.disable('x-powered-by');
-
-app.use(helmet({
-  contentSecurityPolicy: false,
-  crossOriginResourcePolicy: { policy: 'cross-origin' }
-}));
-app.use(compression());
-
-app.use((req, res, next) => {
-  const t = process.hrtime.bigint();
-  res.on('finish', () => {
-    if (req.path === '/health') return;
-    const ms = Number(process.hrtime.bigint() - t) / 1e6;
-    const p = req.path.replace(/\/callback\/.*/, '/callback/***');
-    console.log(`${new Date().toISOString()} ${req.method} ${p} ${res.statusCode} ${ms.toFixed(0)}ms`);
-  });
-  next();
-});
-
-app.use(cors({
-  origin(origin, cb) {
-    if (!origin || !CFG.allowedOrigins.length) return cb(null, true);
-    cb(null, CFG.allowedOrigins.includes(origin.replace(/\/+$/, '')));
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
-  maxAge: 86_400
+  res.json({ ok: true, message: r.data.CustomerMessage || 'Prompt sent.', checkoutRequestId: r.data.CheckoutRequestID });
 }));
 
-const smallJson = express.json({ limit: '50kb' });
-app.use((req, res, next) => (req.path.startsWith('/api/admin/') ? next() : smallJson(req, res, next)));
-
-const limiter = (windowMs, limit, message, extra = {}) => rateLimit({
-  windowMs, limit, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: message }, ...extra
-});
-app.use('/api/', limiter(60_000, 300, 'Too many requests. Please slow down.'));
-const ordersLimiter = limiter(10 * 60_000, 30, 'Too many orders from this connection. Please wait a few minutes.');
-const stkLimiter = limiter(10 * 60_000, 20, 'Too many payment attempts. Please wait a few minutes.');
-const statusLimiter = limiter(60_000, 200, 'Too many status checks. Please slow down.');
-const adminAuthLimiter = limiter(15 * 60_000, 20, 'Too many failed sign-in attempts. Try again in 15 minutes.', {
-  requestWasSuccessful: (req, res) => res.statusCode !== 401
-});
-
-/* ---------------- Health ---------------- */
-app.get('/health', wrap(async (req, res) => {
-  await db.command({ ping: 1 });
-  res.json({ ok: true, mpesa: mpesaConfigured() ? CFG.mpesa.env : 'not-configured' });
-}));
-
-/* =====================================================================
-   PUBLIC API (storefront)
-   ===================================================================== */
-app.get('/api/products', wrap(async (req, res) => {
-  const products = await col.products.find({}).sort({ category: 1, name: 1 }).toArray();
-  res.set('Cache-Control', 'no-cache').json({ products: products.map(p => publicProduct(req, p)) });
-}));
-
-app.get('/api/products/:id/image', wrap(async (req, res) => {
-  const doc = await col.images.findOne({ _id: req.params.id.slice(0, 64) });
-  if (!doc) throw new HttpError(404, 'Image not found.');
-  const etag = `"${doc.hash}"`;
-  res.set({
-    'Content-Type': doc.contentType,
-    'Cache-Control': 'public, max-age=31536000, immutable',
-    ETag: etag,
-    'X-Content-Type-Options': 'nosniff'
-  });
-  if (req.get('If-None-Match') === etag) return res.status(304).end();
-  res.end(Buffer.from(doc.data.buffer.subarray(0, doc.data.position)));
-}));
-
-app.post('/api/orders', ordersLimiter, wrap(async (req, res) => {
-  const key = req.get('Idempotency-Key');
-  if (!key || !/^[\w\-:.]{8,100}$/.test(key)) throw new HttpError(400, 'Missing or invalid Idempotency-Key header.');
-  const requestHash = sha256(JSON.stringify(req.body)).toString('hex');
-
-  const reply = (o, status = 200) => res.status(status).json({ orderId: o._id, reference: o.reference, total: o.total });
-
-  const existing = await col.orders.findOne({ idempotencyKey: key });
-  if (existing) {
-    if (existing.requestHash !== requestHash) throw new HttpError(422, 'This request key was already used for a different order.');
-    return reply(existing);
-  }
-
-  const priced = await priceOrder(req.body);
-  const now = new Date();
-
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const doc = {
-      _id: crypto.randomUUID(),
-      reference: makeReference(),
-      idempotencyKey: key,
-      requestHash,
-      customer: priced.customer,
-      items: priced.items,
-      total: priced.total,
-      currency: 'KES',
-      paymentStatus: 'pending',
-      adminConfirmed: false,
-      mpesaReceipt: null,
-      checkoutRequestId: null,
-      checkoutRequestIds: [],
-      stkAttempts: 0,
-      lastStkAt: null,
-      lastQueryAt: null,
-      failureReason: null,
-      ip: req.ip,
-      createdAt: now,
-      updatedAt: now
-    };
-    try {
-      await col.orders.insertOne(doc);
-      return reply(doc, 201);
-    } catch (e) {
-      if (e.code !== 11000) throw e;
-      if (e.keyPattern?.idempotencyKey) {
-        const again = await col.orders.findOne({ idempotencyKey: key });
-        if (again) return reply(again);
-      }
-    }
-  }
-  throw new HttpError(500, 'Could not create the order. Please try again.');
-}));
-
-app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
-  const orderId = str(req.body?.orderId, { required: true, max: 64, field: 'orderId' });
-  const enteredPhone = normPhone(req.body?.phone);
-  if (!enteredPhone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
-  const phone = CFG.mpesa.testPhone || enteredPhone;
-  if (!mpesaConfigured()) throw new HttpError(503, 'Payments are not available right now. Please contact us.');
-
-  const order = await col.orders.findOne({ _id: orderId });
-  if (!order) throw new HttpError(404, 'Order not found.');
-  if (order.paymentStatus === 'paid') return res.json({ alreadyPaid: true, checkoutRequestId: order.checkoutRequestId });
-  if (order.paymentStatus === 'cancelled') throw new HttpError(409, 'This order was cancelled.');
-  if (order.stkAttempts >= CFG.mpesa.maxAttempts) throw new HttpError(429, 'Too many payment attempts for this order. Please contact us.');
-
-  const now = new Date();
-  const claimed = await col.orders.findOneAndUpdate(
-    {
-      _id: orderId,
-      paymentStatus: { $in: ['pending', 'failed'] },
-      $or: [{ lastStkAt: null }, { lastStkAt: { $lt: new Date(Date.now() - CFG.mpesa.minRetryMs) } }]
-    },
-    { $set: { paymentStatus: 'pending', failureReason: null, lastStkAt: now, updatedAt: now }, $inc: { stkAttempts: 1 } },
-    { returnDocument: 'after' }
-  );
-  if (!claimed) {
-    const cur = await col.orders.findOne({ _id: orderId });
-    if (cur?.paymentStatus === 'paid') return res.json({ alreadyPaid: true, checkoutRequestId: cur.checkoutRequestId });
-    return res.json({ checkoutRequestId: cur?.checkoutRequestId || null, reused: true });
-  }
-
-  let sent;
-  try {
-    sent = await sendStkPush(claimed, phone);
-  } catch (e) {
-    await col.orders.updateOne({ _id: orderId }, { $set: { lastStkAt: null } });
-    throw e;
-  }
-
-  await col.orders.updateOne({ _id: orderId }, {
-    $set: { checkoutRequestId: sent.checkoutRequestId, merchantRequestId: sent.merchantRequestId, payerPhone: phone, updatedAt: new Date() },
-    $addToSet: { checkoutRequestIds: sent.checkoutRequestId }
-  });
-  const sentTo = `+${phone.slice(0, 5)}•••${phone.slice(-3)}`;
-  res.json({ checkoutRequestId: sent.checkoutRequestId, sentTo });
-}));
-
-app.post('/api/payments/callback/:secret', wrap(async (req, res) => {
-  if (!CFG.mpesa.callbackSecret || !safeEqual(req.params.secret, CFG.mpesa.callbackSecret)) {
-    return res.status(403).json({ ResultCode: 1, ResultDesc: 'Forbidden' });
-  }
-  if (CFG.mpesa.callbackIps.length && !CFG.mpesa.callbackIps.includes(req.ip)) {
-    console.warn('Callback rejected from IP', req.ip);
-    return res.status(403).json({ ResultCode: 1, ResultDesc: 'Forbidden' });
-  }
-  try { await handleStkCallback(req.body); } catch (e) { console.error('Callback processing error:', e); }
+/* ---- Daraja callback ---- */
+app.post('/api/pay/callback/:secret', ah(async (req, res) => {
+  if (!DARAJA.cbSecret || !safeEq(req.params.secret, DARAJA.cbSecret)) return res.status(404).json({ error: 'Not found.' });
+  try { await processCallback(req.body); }
+  catch (e) { console.error('[callback]', e); }
   res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
 }));
 
-app.get('/api/orders/:id/status', statusLimiter, wrap(async (req, res) => {
-  let o = await col.orders.findOne({ _id: req.params.id.slice(0, 64) });
+/* ---- Public: order status (polled by the storefront) ---- */
+app.get('/api/orders/:id/status', statusLimiter, ah(async (req, res) => {
+  const id = req.params.id;
+  if (typeof id !== 'string' || id.length > 64) throw new HttpError(404, 'Order not found.');
+  let o = await Order.findOne({ id });
   if (!o) throw new HttpError(404, 'Order not found.');
-
-  if (o.paymentStatus === 'pending' && o.checkoutRequestId && CFG.mpesa.reconcile && mpesaConfigured()
-      && o.lastStkAt && Date.now() - o.lastStkAt.getTime() > 25_000) {
-    try { o = await reconcileOrder(o); } catch (e) { console.warn('Reconcile skipped:', e.message); }
+  if (o.paymentStatus === 'pending') {
+    await reconcile(o);
+    o = await Order.findOne({ id });
   }
-
-  res.set('Cache-Control', 'no-store').json({
+  res.json({
+    orderId: o.id,
+    reference: o.reference,
     paymentStatus: o.paymentStatus,
     adminConfirmed: !!o.adminConfirmed,
-    mpesaReceipt: o.mpesaReceipt || null,
-    reference: o.reference,
-    message: o.failureReason || null
+    mpesaReceipt: o.paymentStatus === 'paid' ? (o.mpesaReceipt || '') : '',
+    message: o.paymentMessage || ''
   });
 }));
 
-/* =====================================================================
-   ADMIN API (HTTP Basic auth)
-   ===================================================================== */
-function requireAdmin(req, res, next) {
-  const header = req.get('Authorization') || '';
-  let user = '';
-  let pass = '';
-  if (header.startsWith('Basic ')) {
-    const decoded = Buffer.from(header.slice(6), 'base64').toString('utf8');
-    const i = decoded.indexOf(':');
-    if (i >= 0) { user = decoded.slice(0, i); pass = decoded.slice(i + 1); }
-  }
-  const okUser = safeEqual(user, CFG.admin.user);
-  const okPass = safeEqual(pass, CFG.admin.pass);
-  if (okUser && okPass) { req.admin = { user }; return next(); }
-  res.status(401).json({ error: 'Invalid username or password.' });
+/* ---- Admin auth ---- */
+function adminAuth(req, res, next) {
+  const user = env.ADMIN_USERNAME, pass = env.ADMIN_PASSWORD;
+  if (!user || !pass) return next(new HttpError(503, 'Admin login is not configured on the server.'));
+  const h = req.get('Authorization') || '';
+  if (!h.startsWith('Basic ')) return next(new HttpError(401, 'Authentication required.'));
+  let decoded = '';
+  try { decoded = Buffer.from(h.slice(6), 'base64').toString('utf8'); } catch { /* ignore */ }
+  const i = decoded.indexOf(':');
+  const u = i < 0 ? '' : decoded.slice(0, i), p = i < 0 ? '' : decoded.slice(i + 1);
+  const okU = safeEq(u, user), okP = safeEq(p, pass); // evaluate both
+  if (!(okU && okP)) return next(new HttpError(401, 'Wrong username or password.'));
+  req.admin = u;
+  next();
 }
+app.use('/api/admin', adminLimiter, adminAuth);
 
-const admin = express.Router();
-admin.use(adminAuthLimiter, requireAdmin, express.json({ limit: '4mb' }));
-admin.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
-
-/* ---- Orders ---- */
-const ORDER_FILTERS = {
-  all: () => ({}),
-  paid: () => ({ paymentStatus: 'paid', adminConfirmed: false }),
-  confirmed: () => ({ adminConfirmed: true }),
-  pending: () => ({ paymentStatus: 'pending' }),
-  failed: () => ({ paymentStatus: 'failed' }),
-  cancelled: () => ({ paymentStatus: 'cancelled' })
-};
-
-admin.get('/orders', wrap(async (req, res) => {
-  const status = typeof req.query.status === 'string' ? req.query.status : 'all';
-  if (!ORDER_FILTERS[status]) throw new HttpError(400, 'Unknown status filter.');
-  const orders = await col.orders.find(ORDER_FILTERS[status]()).sort({ createdAt: -1 }).limit(500).toArray();
-  res.json({ orders: orders.map(adminOrder) });
+/* ---- Admin: products ---- */
+app.get('/api/admin/products', ah(async (req, res) => {
+  const list = await Product.find().sort({ category: 1, name: 1 }).lean();
+  res.json({ products: list.map(productOut) });
 }));
-
-admin.post('/orders/:id/confirm', wrap(async (req, res) => {
-  const now = new Date();
-  const o = await col.orders.findOneAndUpdate(
-    { _id: req.params.id, paymentStatus: 'paid', adminConfirmed: false },
-    { $set: { adminConfirmed: true, confirmedAt: now, confirmedBy: req.admin.user, updatedAt: now } },
-    { returnDocument: 'after' }
-  );
-  if (o) return res.json({ ok: true, order: adminOrder(o) });
-
-  const cur = await col.orders.findOne({ _id: req.params.id });
-  if (!cur) throw new HttpError(404, 'Order not found.');
-  if (cur.adminConfirmed) return res.json({ ok: true, order: adminOrder(cur) });
-  throw new HttpError(409, cur.paymentStatus === 'cancelled' ? 'This order was cancelled.' : 'Payment has not been received for this order yet.');
+app.post('/api/admin/products', ah(async (req, res) => {
+  const p = await Product.create(cleanProduct(req.body));
+  res.status(201).json({ product: productOut(p.toObject()) });
 }));
-
-admin.post('/orders/:id/reject', wrap(async (req, res) => {
-  const now = new Date();
-  const o = await col.orders.findOneAndUpdate(
-    { _id: req.params.id, adminConfirmed: false, paymentStatus: { $ne: 'cancelled' } },
-    {
-      $set: {
-        paymentStatus: 'cancelled',
-        failureReason: 'This order was cancelled by the store. If money was deducted, contact us with your order reference.',
-        cancelledAt: now, cancelledBy: req.admin.user, updatedAt: now
-      }
-    },
-    { returnDocument: 'after' }
-  );
-  if (o) return res.json({ ok: true, order: adminOrder(o) });
-
-  const cur = await col.orders.findOne({ _id: req.params.id });
-  if (!cur) throw new HttpError(404, 'Order not found.');
-  throw new HttpError(409, cur.adminConfirmed ? 'This order was already released and cannot be cancelled.' : 'This order is already cancelled.');
+app.put('/api/admin/products/:id', ah(async (req, res) => {
+  if (!isObjectId(req.params.id)) throw new HttpError(404, 'Product not found.');
+  const p = await Product.findByIdAndUpdate(req.params.id, { $set: cleanProduct(req.body) }, { new: true, runValidators: true }).lean();
+  if (!p) throw new HttpError(404, 'Product not found.');
+  res.json({ product: productOut(p) });
 }));
-
-/* ---- Products ---- */
-admin.get('/products', wrap(async (req, res) => {
-  const products = await col.products.find({}).sort({ category: 1, name: 1 }).toArray();
-  res.json({ products: products.map(p => publicProduct(req, p)) });
-}));
-
-admin.post('/products', wrap(async (req, res) => {
-  const id = crypto.randomUUID();
-  const data = sanitizeProduct(req.body);
-  const img = parseImageInput(req.body.image, id);
-  const now = new Date();
-  const doc = { _id: id, ...data, image: img.action === 'keep' ? null : await applyImage(id, img), createdAt: now, updatedAt: now };
-  await col.products.insertOne(doc);
-  res.status(201).json({ product: publicProduct(req, doc) });
-}));
-
-admin.put('/products/:id', wrap(async (req, res) => {
-  const id = req.params.id.slice(0, 64);
-  const existing = await col.products.findOne({ _id: id });
-  if (!existing) throw new HttpError(404, 'Product not found.');
-  const data = sanitizeProduct(req.body);
-  const img = parseImageInput(req.body.image, id);
-  const set = { ...data, updatedAt: new Date() };
-  if (img.action !== 'keep') set.image = await applyImage(id, img);
-  const updated = await col.products.findOneAndUpdate({ _id: id }, { $set: set }, { returnDocument: 'after' });
-  res.json({ product: publicProduct(req, updated) });
-}));
-
-admin.delete('/products/:id', wrap(async (req, res) => {
-  const id = req.params.id.slice(0, 64);
-  const r = await col.products.deleteOne({ _id: id });
+app.delete('/api/admin/products/:id', ah(async (req, res) => {
+  if (!isObjectId(req.params.id)) throw new HttpError(404, 'Product not found.');
+  const r = await Product.deleteOne({ _id: req.params.id });
   if (!r.deletedCount) throw new HttpError(404, 'Product not found.');
-  await col.images.deleteOne({ _id: id });
   res.json({ ok: true });
 }));
 
-app.use('/api/admin', admin);
+/* ---- Admin: orders ---- */
+const ORDER_FILTERS = {
+  all: {},
+  paid: { paymentStatus: 'paid', adminConfirmed: false },
+  pending: { paymentStatus: { $in: ['pending', 'failed'] } },
+  cancelled: { paymentStatus: 'cancelled' },
+  released: { adminConfirmed: true }
+};
+app.get('/api/admin/orders', ah(async (req, res) => {
+  const f = ORDER_FILTERS[String(req.query.status || 'all')] || ORDER_FILTERS.all;
+  const list = await Order.find(f).sort({ createdAt: -1 }).limit(500).lean();
+  res.json({ orders: list.map(orderOut) });
+}));
+app.post('/api/admin/orders/:id/confirm', ah(async (req, res) => {
+  const o = await Order.findOneAndUpdate(
+    { id: req.params.id, paymentStatus: 'paid', adminConfirmed: false },
+    { $set: { adminConfirmed: true, confirmedAt: new Date(), confirmedBy: req.admin } },
+    { new: true }
+  ).lean();
+  if (o) return res.json({ order: orderOut(o) });
+  const cur = await Order.findOne({ id: req.params.id }).lean();
+  if (!cur) throw new HttpError(404, 'Order not found.');
+  if (cur.adminConfirmed) throw new HttpError(409, 'This order has already been released.');
+  if (cur.paymentStatus === 'cancelled') throw new HttpError(409, 'This order was cancelled.');
+  throw new HttpError(409, 'The customer has not paid yet.');
+}));
+app.post('/api/admin/orders/:id/reject', ah(async (req, res) => {
+  const o = await Order.findOneAndUpdate(
+    { id: req.params.id, adminConfirmed: false, paymentStatus: { $ne: 'cancelled' } },
+    { $set: { paymentStatus: 'cancelled', cancelledAt: new Date(), paymentMessage: 'This order was cancelled by the store.' } },
+    { new: true }
+  ).lean();
+  if (o) return res.json({ order: orderOut(o) });
+  const cur = await Order.findOne({ id: req.params.id }).lean();
+  if (!cur) throw new HttpError(404, 'Order not found.');
+  if (cur.adminConfirmed) throw new HttpError(409, 'This order has already been released and cannot be cancelled.');
+  throw new HttpError(409, 'This order is already cancelled.');
+}));
 
-/* =====================================================================
-   STATIC FRONTENDS (optional): drop index.html + admin.html in ./public
-   ===================================================================== */
-const PUBLIC_DIR = path.join(__dirname, 'public');
-if (fs.existsSync(PUBLIC_DIR)) {
-  app.use(express.static(PUBLIC_DIR, { extensions: ['html'], maxAge: '5m' }));
-}
-app.get('/', (req, res) => res.json({ name: 'Maricopa Concrete & Allied API', status: 'ok' }));
-
-/* ---------------- 404 + errors ---------------- */
-app.use('/api', (req, res) => res.status(404).json({ error: 'Not found.' }));
-
+/* ---- 404 + errors ---- */
+app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
+// eslint-disable-next-line no-unused-vars
 app.use((err, req, res, next) => {
-  if (res.headersSent) return next(err);
-  if (err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
-  if (err.type === 'entity.too.large') return res.status(413).json({ error: 'Request is too large.' });
-  const status = Number.isInteger(err.status) && err.status >= 400 && err.status < 600 ? err.status : 500;
-  if (status >= 500) console.error(err);
-  res.status(status).json({ error: err.expose || status < 500 ? err.message : 'Something went wrong on our side. Please try again.' });
+  if (err instanceof HttpError) return res.status(err.status).json({ error: err.message });
+  if (err && err.type === 'entity.parse.failed') return res.status(400).json({ error: 'Invalid JSON.' });
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'The request is too large.' });
+  if (err && err.name === 'ValidationError') return res.status(400).json({ error: err.message });
+  console.error('[error]', err);
+  res.status(500).json({ error: 'Something went wrong on the server.' });
 });
 
-/* =====================================================================
-   START / SHUTDOWN
-   ===================================================================== */
-let server;
+/* ---------------- Start ---------------- */
+const SAMPLE = [
+  { name: 'Ready-mix concrete C25', category: 'Concrete', emoji: '🚛', unit: 'per m³', price: 14500,
+    description: 'Ready-mix concrete for slabs, beams and columns, delivered to site.',
+    specs: [['Grade', 'C25'], ['Aggregate', '20 mm']],
+    options: [{ key: 'Slump', choices: [{ value: '75–100 mm', priceAdjust: 0 }, { value: '100–150 mm', priceAdjust: 300 }] }] },
+  { name: 'Portland cement 50 kg', category: 'Cement', emoji: '🧱', unit: 'per bag', price: 850,
+    description: 'General-purpose Portland cement, 50 kg bag.', specs: [['Weight', '50 kg'], ['Class', '42.5N']], options: [] },
+  { name: 'Building sand', category: 'Aggregates', emoji: '⛰️', unit: 'per m³', price: 3200,
+    description: 'Clean river sand for plaster and mortar.', specs: [], options: [] },
+  { name: 'Hollow block 6"', category: 'Blocks', emoji: '🧱', unit: 'per block', price: 75,
+    description: 'Machine-cut hollow concrete block.', specs: [['Size', '6 inch']], options: [] }
+];
 
-async function start() {
-  assertConfig();
-  await connectDb();
-  server = app.listen(CFG.port, () => {
-    console.log(`✅ Maricopa API listening on :${CFG.port}  (db: ${CFG.dbName}, M-Pesa: ${mpesaConfigured() ? CFG.mpesa.env : 'not configured'})`);
-  });
-  server.keepAliveTimeout = 65_000;
-}
+async function main() {
+  if (!env.MONGODB_URI) { console.error('MONGODB_URI is required.'); process.exit(1); }
+  if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
+  else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
+  if (!darajaReady()) console.warn('⚠️  Daraja is not fully configured (need DARAJA_CONSUMER_KEY/SECRET/SHORTCODE/PASSKEY, PUBLIC_URL, CALLBACK_SECRET). Payments disabled.');
+  if (!allowed.length) console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it in production.');
 
-async function shutdown(signal) {
-  console.log(`\n${signal} received — shutting down…`);
-  const force = setTimeout(() => process.exit(1), 10_000);
-  force.unref();
-  try {
-    if (server) await new Promise(r => server.close(r));
-    if (client) await client.close();
-  } finally {
-    process.exit(0);
+  await mongoose.connect(env.MONGODB_URI, { serverSelectionTimeoutMS: 20000 });
+  await Promise.all([Product.init(), Order.init()]);
+  console.log('✅ MongoDB connected');
+
+  if (env.SEED_SAMPLE_PRODUCTS === 'true' && (await Product.countDocuments()) === 0) {
+    await Product.insertMany(SAMPLE);
+    console.log('🌱 Seeded sample products');
   }
-}
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('unhandledRejection', e => console.error('Unhandled rejection:', e));
 
-start().catch(e => {
-  console.error('Failed to start:', e.message);
-  process.exit(1);
-});
+  const server = app.listen(PORT, '0.0.0.0', () => console.log(`🚀 Server listening on :${PORT} (M-Pesa: ${darajaReady() ? DARAJA.env : 'off'})`));
+  const stop = () => server.close(() => mongoose.connection.close(false).then(() => process.exit(0)));
+  process.on('SIGTERM', stop);
+  process.on('SIGINT', stop);
+}
+process.on('unhandledRejection', e => console.error('[unhandledRejection]', e));
+main().catch(e => { console.error('Failed to start:', e.message); process.exit(1); });
