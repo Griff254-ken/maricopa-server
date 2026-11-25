@@ -64,6 +64,7 @@ const CFG = {
     partyB: env.MPESA_PARTY_B || env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
     txType: env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
     callbackSecret: env.MPESA_CALLBACK_SECRET || '',
+    testPhone: normPhone(env.MPESA_TEST_PHONE || ''), // optional: force every STK prompt to this number while testing
     callbackIps: list(env.MPESA_CALLBACK_IPS),
     reconcile: flag(env.MPESA_RECONCILE, true),
     maxAttempts: 8,
@@ -84,6 +85,12 @@ function assertConfig() {
   if (errors.length) {
     console.error('\nConfiguration error:\n - ' + errors.join('\n - ') + '\n');
     process.exit(1);
+  }
+  if (CFG.mpesa.testPhone) {
+    console.warn(`⚠️  MPESA_TEST_PHONE is set: every M-Pesa prompt goes to ${CFG.mpesa.testPhone}, whatever number the customer enters. Remove it before going live.`);
+  }
+  if (env.MPESA_TEST_PHONE && !CFG.mpesa.testPhone) {
+    console.warn('⚠️  MPESA_TEST_PHONE is not a valid Safaricom number and was ignored.');
   }
   if (!mpesaConfigured()) {
     const m = CFG.mpesa;
@@ -752,8 +759,9 @@ app.post('/api/orders', ordersLimiter, wrap(async (req, res) => {
 
 app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
   const orderId = str(req.body?.orderId, { required: true, max: 64, field: 'orderId' });
-  const phone = normPhone(req.body?.phone);
-  if (!phone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
+  const enteredPhone = normPhone(req.body?.phone);
+  if (!enteredPhone) throw new HttpError(400, 'Enter a valid Safaricom number, e.g. 0712 345 678.');
+  const phone = CFG.mpesa.testPhone || enteredPhone; // test override (see MPESA_TEST_PHONE)
   if (!mpesaConfigured()) throw new HttpError(503, 'Payments are not available right now. Please contact us.');
 
   const order = await col.orders.findOne({ _id: orderId });
@@ -791,7 +799,9 @@ app.post('/api/mpesa/stkpush', stkLimiter, wrap(async (req, res) => {
     $set: { checkoutRequestId: sent.checkoutRequestId, merchantRequestId: sent.merchantRequestId, payerPhone: phone, updatedAt: new Date() },
     $addToSet: { checkoutRequestIds: sent.checkoutRequestId }
   });
-  res.json({ checkoutRequestId: sent.checkoutRequestId });
+  // Masked number the prompt actually went to (differs from the typed one when MPESA_TEST_PHONE is set).
+  const sentTo = `+${phone.slice(0, 5)}•••${phone.slice(-3)}`;
+  res.json({ checkoutRequestId: sent.checkoutRequestId, sentTo });
 }));
 
 /* Safaricom → us. Path secret + optional IP allow-list (Daraja callbacks are unsigned). */
