@@ -49,7 +49,8 @@ const CFG = {
   port: Number(env.PORT) || 3000,
   mongoUri: env.MONGODB_URI,
   dbName: env.MONGODB_DB || 'maricopa',
-  publicUrl: (env.PUBLIC_URL || '').replace(/\/+$/, ''),
+  publicUrl: (env.PUBLIC_URL || env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''), // Render sets RENDER_EXTERNAL_URL automatically
+  collectionPrefix: env.COLLECTION_PREFIX ?? 'store_',
   allowedOrigins: list(env.ALLOWED_ORIGINS).map(o => o.replace(/\/+$/, '')),
   trustProxy: parseTrustProxy(env.TRUST_PROXY),
   seedDemo: flag(env.SEED_DEMO_PRODUCTS, false),
@@ -58,9 +59,9 @@ const CFG = {
     env: env.MPESA_ENV === 'production' ? 'production' : 'sandbox',
     key: env.MPESA_CONSUMER_KEY || '',
     secret: env.MPESA_CONSUMER_SECRET || '',
-    shortcode: env.MPESA_SHORTCODE || '',
-    passkey: env.MPESA_PASSKEY || '',
-    partyB: env.MPESA_PARTY_B || env.MPESA_SHORTCODE || '',
+    shortcode: env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
+    passkey: env.MPESA_PASSKEY || (env.MPESA_ENV === 'production' ? '' : 'bfb279f9aa9bdbcf158e97dd71a467cd2e0c893059b10f78e6b72ada1ed2c919'), // public Daraja sandbox passkey
+    partyB: env.MPESA_PARTY_B || env.MPESA_SHORTCODE || (env.MPESA_ENV === 'production' ? '' : '174379'),
     txType: env.MPESA_TRANSACTION_TYPE === 'CustomerBuyGoodsOnline' ? 'CustomerBuyGoodsOnline' : 'CustomerPayBillOnline',
     callbackSecret: env.MPESA_CALLBACK_SECRET || '',
     callbackIps: list(env.MPESA_CALLBACK_IPS),
@@ -69,6 +70,10 @@ const CFG = {
     minRetryMs: 25_000
   }
 };
+// No MPESA_CALLBACK_SECRET set? Derive a stable private one from your consumer secret.
+if (!CFG.mpesa.callbackSecret && CFG.mpesa.secret) {
+  CFG.mpesa.callbackSecret = crypto.createHmac('sha256', CFG.mpesa.secret).update('maricopa-callback').digest('hex').slice(0, 40);
+}
 CFG.mpesa.base = CFG.mpesa.env === 'production' ? 'https://api.safaricom.co.ke' : 'https://sandbox.safaricom.co.ke';
 
 function assertConfig() {
@@ -81,7 +86,13 @@ function assertConfig() {
     process.exit(1);
   }
   if (!mpesaConfigured()) {
-    console.warn('⚠️  M-Pesa is not fully configured (need MPESA_CONSUMER_KEY/SECRET, MPESA_SHORTCODE, MPESA_PASSKEY, MPESA_CALLBACK_SECRET and PUBLIC_URL). STK push will return 503.');
+    const m = CFG.mpesa;
+    const missing = [
+      !m.key && 'MPESA_CONSUMER_KEY', !m.secret && 'MPESA_CONSUMER_SECRET',
+      !m.shortcode && 'MPESA_SHORTCODE', !m.passkey && 'MPESA_PASSKEY',
+      !CFG.publicUrl && 'PUBLIC_URL'
+    ].filter(Boolean);
+    console.warn(`⚠️  M-Pesa disabled — missing environment variable(s): ${missing.join(', ')}. Add them in your host's Environment settings (Render → Environment). STK push returns 503 until then.`);
   }
   if (IS_PROD && !CFG.allowedOrigins.length) {
     console.warn('⚠️  ALLOWED_ORIGINS is empty: any website can call this API. Set it to your storefront/admin origins.');
@@ -158,20 +169,30 @@ async function connectDb() {
   });
   await client.connect();
   db = client.db(CFG.dbName);
-  col.products = db.collection('products');
-  col.images = db.collection('product_images');
-  col.orders = db.collection('orders');
-  col.callbacks = db.collection('payment_callbacks');
+  // Prefixed so we never collide with other apps (e.g. the inventory app) in the same database.
+  const pf = CFG.collectionPrefix;
+  col.products = db.collection(pf + 'products');
+  col.images = db.collection(pf + 'product_images');
+  col.orders = db.collection(pf + 'orders');
+  col.callbacks = db.collection(pf + 'payment_callbacks');
 
+  // Explicitly named indexes; a conflicting pre-existing index is logged, never fatal.
+  const ensure = async (collection, key, options) => {
+    try {
+      await collection.createIndex(key, options);
+    } catch (e) {
+      console.warn(`⚠️  Index "${options.name}" on ${collection.collectionName} skipped: ${e.message}`);
+    }
+  };
   await Promise.all([
-    col.products.createIndex({ category: 1, name: 1 }),
-    col.orders.createIndex({ reference: 1 }, { unique: true }),
-    col.orders.createIndex({ createdAt: -1 }),
-    col.orders.createIndex({ paymentStatus: 1, adminConfirmed: 1, createdAt: -1 }),
-    col.orders.createIndex({ checkoutRequestIds: 1 }),
-    col.orders.createIndex({ idempotencyKey: 1 }, { unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }),
-    col.orders.createIndex({ mpesaReceipt: 1 }, { unique: true, partialFilterExpression: { mpesaReceipt: { $type: 'string' } } }),
-    col.callbacks.createIndex({ receivedAt: 1 }, { expireAfterSeconds: 90 * 24 * 3600 })
+    ensure(col.products, { category: 1, name: 1 }, { name: 'mca_category_name' }),
+    ensure(col.orders, { reference: 1 }, { name: 'mca_reference_unique', unique: true }),
+    ensure(col.orders, { createdAt: -1 }, { name: 'mca_created' }),
+    ensure(col.orders, { paymentStatus: 1, adminConfirmed: 1, createdAt: -1 }, { name: 'mca_status_created' }),
+    ensure(col.orders, { checkoutRequestIds: 1 }, { name: 'mca_checkout_ids' }),
+    ensure(col.orders, { idempotencyKey: 1 }, { name: 'mca_idem_unique', unique: true, partialFilterExpression: { idempotencyKey: { $type: 'string' } } }),
+    ensure(col.orders, { mpesaReceipt: 1 }, { name: 'mca_receipt_unique', unique: true, partialFilterExpression: { mpesaReceipt: { $type: 'string' } } }),
+    ensure(col.callbacks, { receivedAt: 1 }, { name: 'mca_callbacks_ttl', expireAfterSeconds: 90 * 24 * 3600 })
   ]);
 
   if (CFG.seedDemo && (await col.products.estimatedDocumentCount()) === 0) {
