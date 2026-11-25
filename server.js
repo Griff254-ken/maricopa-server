@@ -1,5 +1,27 @@
 'use strict';
+/* =====================================================================
+   Maricopa Concrete & Allied — backend
+   Express + MongoDB Atlas (mongoose) + Safaricom Daraja (M-Pesa STK Push)
 
+   Endpoints (match index.html and admin.html exactly)
+
+   PUBLIC
+     GET  /health
+     GET  /api/products
+     POST /api/orders                      (needs Idempotency-Key header)
+     POST /api/mpesa/stkpush
+     GET  /api/orders/:id/status
+   DARAJA (called by Safaricom)
+     POST /api/pay/callback/:secret
+   ADMIN (HTTP Basic auth)
+     GET    /api/admin/products
+     POST   /api/admin/products
+     PUT    /api/admin/products/:id
+     DELETE /api/admin/products/:id
+     GET    /api/admin/orders?status=all|paid|pending|cancelled|released
+     POST   /api/admin/orders/:id/confirm
+     POST   /api/admin/orders/:id/reject
+   ===================================================================== */
 require('dotenv').config();
 const crypto = require('crypto');
 const express = require('express');
@@ -333,13 +355,27 @@ async function reconcile(order) {
 const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 
 const allowed = (env.ALLOWED_ORIGINS || '').split(',').map(s => s.trim().replace(/\/+$/, '')).filter(Boolean);
+const allowAll = !allowed.length || allowed.includes('*');
+const originAllowed = origin => !origin || allowAll || allowed.includes(String(origin).replace(/\/+$/, ''));
+
+/* /health is open to every origin so the admin page can diagnose connection problems.
+   It reveals nothing sensitive (only whether this caller's origin is allowed). */
+app.get('/health', cors({ origin: true }), (req, res) => res.json({
+  status: 'ok',
+  db: mongoose.connection.readyState === 1,
+  mpesa: darajaReady() ? DARAJA.env : 'not configured',
+  yourOrigin: req.get('Origin') || null,
+  originAllowed: originAllowed(req.get('Origin'))
+}));
+
 app.use(cors({
   origin: (origin, cb) => {
-    if (!origin || !allowed.length || allowed.includes(origin)) return cb(null, true);
-    cb(new HttpError(403, 'This website is not allowed to use the server (add it to ALLOWED_ORIGINS).'));
+    if (originAllowed(origin)) return cb(null, true);
+    console.warn(`[cors] blocked origin "${origin}". Add it to ALLOWED_ORIGINS (current: ${allowed.join(', ')})`);
+    cb(new HttpError(403, `This website (${origin}) is not allowed to use the server. Add it to ALLOWED_ORIGINS.`));
   },
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key'],
@@ -359,11 +395,7 @@ const adminLimiter = rateLimit({
 
 /* ---- Health ---- */
 app.get('/', (req, res) => res.json({ name: 'Maricopa server', ok: true }));
-app.get('/health', (req, res) => res.json({
-  status: 'ok',
-  db: mongoose.connection.readyState === 1,
-  mpesa: darajaReady() ? DARAJA.env : 'not configured'
-}));
+
 
 /* ---- Public: products ---- */
 app.get('/api/products', ah(async (req, res) => {
@@ -554,7 +586,7 @@ app.get('/api/orders/:id/status', statusLimiter, ah(async (req, res) => {
 
 /* ---- Admin auth ---- */
 function adminAuth(req, res, next) {
-  const user = env.ADMIN_USERNAME, pass = env.ADMIN_PASSWORD;
+  const user = (env.ADMIN_USERNAME || '').trim(), pass = (env.ADMIN_PASSWORD || '').trim();
   if (!user || !pass) return next(new HttpError(503, 'Admin login is not configured on the server.'));
   const h = req.get('Authorization') || '';
   if (!h.startsWith('Basic ')) return next(new HttpError(401, 'Authentication required.'));
@@ -658,6 +690,7 @@ const SAMPLE = [
 
 async function main() {
   if (!env.MONGODB_URI) { console.error('MONGODB_URI is required.'); process.exit(1); }
+  if (/^["']|["']$/.test((env.ADMIN_USERNAME || '') + (env.ADMIN_PASSWORD || ''))) console.warn('⚠️  ADMIN_USERNAME/ADMIN_PASSWORD contain quote characters. In Render, enter values WITHOUT quotes.');
   if (!env.ADMIN_USERNAME || !env.ADMIN_PASSWORD) console.warn('⚠️  ADMIN_USERNAME / ADMIN_PASSWORD not set: admin login is disabled.');
   else if (env.ADMIN_PASSWORD.length < 10) console.warn('⚠️  ADMIN_PASSWORD is short. Use at least 12 characters.');
   if (!darajaReady()) console.warn('⚠️  Daraja is not fully configured (need DARAJA_CONSUMER_KEY/SECRET/SHORTCODE/PASSKEY, PUBLIC_URL, CALLBACK_SECRET). Payments disabled.');
